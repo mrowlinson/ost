@@ -103,6 +103,19 @@ enum Commands {
         path: String,
     },
 
+    /// Create a view-only sharing link for a shared file
+    FilesLink {
+        /// Drive ID (from `files` list output)
+        drive_id: String,
+
+        /// DriveItem ID
+        item_id: String,
+
+        /// Link scope: organization (org-only, default) or anonymous
+        #[arg(long, default_value = "organization")]
+        scope: String,
+    },
+
     /// Show current user info (verify auth works)
     Whoami,
 
@@ -225,6 +238,13 @@ async fn main() -> Result<()> {
         Commands::FilesUpload { to, path } => {
             tracing::info!("Uploading file...");
             api::upload_file(&to, &path).await?;
+        }
+        Commands::FilesLink {
+            drive_id,
+            item_id,
+            scope,
+        } => {
+            api::create_link(&drive_id, &item_id, &scope).await?;
         }
         Commands::Whoami => {
             api::whoami().await?;

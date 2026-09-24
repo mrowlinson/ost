@@ -28,8 +28,8 @@ pub use teams::ChannelInfo;
 pub use chat::{list_chats_data, read_messages_data, send_message_with_client};
 #[allow(unused_imports)]
 pub use files::{
-    download_file_data, folder_children_path, list_chat_files_data, list_chat_files_data_opts,
-    list_folder_children_data, upload_file_data,
+    create_link_data, download_file_data, folder_children_path, list_chat_files_data,
+    list_chat_files_data_opts, list_folder_children_data, upload_file_data,
 };
 pub use me::whoami_data;
 pub use presence::get_presence_data;
@@ -83,4 +83,9 @@ pub async fn download_file(drive_id: &str, item_id: &str, dest: &str) -> Result<
 /// Upload a local file to a chat or channel
 pub async fn upload_file(chat_id: &str, local_path: &str) -> Result<()> {
     files::upload_file(chat_id, local_path).await
+}
+
+/// Create a view-only sharing link for a shared file
+pub async fn create_link(drive_id: &str, item_id: &str, scope: &str) -> Result<()> {
+    files::create_link(drive_id, item_id, scope).await
 }
