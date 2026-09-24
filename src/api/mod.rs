@@ -14,7 +14,7 @@ use anyhow::Result;
 pub use chat::{ChatInfo, MessageInfo};
 // Re-exported for future TUI/file-browser callers; unused by the CLI today.
 #[allow(unused_imports)]
-pub use files::SharedFile;
+pub use files::{FileVersion, SharedFile};
 pub use me::UserInfo;
 pub use presence::PresenceInfo;
 pub use teams::TeamInfo;
@@ -28,8 +28,9 @@ pub use teams::ChannelInfo;
 pub use chat::{list_chats_data, read_messages_data, send_message_with_client};
 #[allow(unused_imports)]
 pub use files::{
-    create_link_data, download_file_data, folder_children_path, list_chat_files_data,
-    list_chat_files_data_opts, list_folder_children_data, upload_file_data,
+    create_link_data, download_file_data, download_file_version_data, folder_children_path,
+    list_chat_files_data, list_chat_files_data_opts, list_file_versions_data,
+    list_folder_children_data, restore_file_version_data, upload_file_data,
 };
 pub use me::whoami_data;
 pub use presence::get_presence_data;
