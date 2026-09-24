@@ -11,7 +11,7 @@ mod teams;
 use anyhow::Result;
 
 // Re-export data types for TUI integration
-pub use chat::{ChatInfo, MessageInfo, MessagesPage};
+pub use chat::{ChatInfo, MessageInfo, MessagesPage, ReadReceipt};
 pub use me::UserInfo;
 pub use presence::PresenceInfo;
 pub use teams::TeamInfo;
@@ -23,8 +23,11 @@ pub use teams::ChannelInfo;
 
 // Re-export data-returning functions for TUI integration
 pub use chat::{
-    delete_message_with_client, edit_message_body, edit_message_with_client, list_chats_data,
-    message_url, read_messages_data, read_messages_page, send_message_with_client,
+    consumptionhorizon_body, consumptionhorizon_url, consumptionhorizon_value,
+    consumptionhorizons_url, delete_message_with_client, edit_message_body, edit_message_with_client,
+    list_chats_data, mark_read_with_client, message_url, parse_consumptionhorizons,
+    read_messages_data, read_messages_page, read_receipts_data, receipt_message_id,
+    send_message_with_client,
 };
 pub use media::{fetch_media_data, MediaBytes, MAX_BYTES};
 pub use me::whoami_data;
