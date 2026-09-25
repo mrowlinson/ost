@@ -33,7 +33,11 @@ pub use chat::{
 pub use media::{fetch_media_data, MediaBytes, MAX_BYTES};
 pub use me::whoami_data;
 pub use presence::get_presence_data;
-pub use teams::list_teams_data;
+pub use teams::{
+    channel_react_body, channel_reply_set_reaction_path, channel_reply_unset_reaction_path,
+    channel_set_reaction_path, channel_unset_reaction_path, list_teams_data,
+    set_channel_reaction_data, unset_channel_reaction_data,
+};
 
 /// List recent chats (native Teams API)
 pub async fn list_chats(limit: usize) -> Result<()> {
