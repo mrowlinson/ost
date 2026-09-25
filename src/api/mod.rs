@@ -24,7 +24,8 @@ pub use teams::ChannelInfo;
 // Re-export data-returning functions for TUI integration
 pub use chat::{
     delete_message_with_client, edit_message_body, edit_message_with_client,
-    emoji_for_reaction_type, list_chats_data, message_url, reaction_add_body, reaction_add_url,
+    emoji_for_reaction_type, leave_chat_with_client, leave_member_url, list_chats_data,
+    message_url, own_member_mri, reaction_add_body, reaction_add_url,
     reaction_remove_url, reaction_type_for_emoji, read_messages_data, read_messages_page,
     remove_reaction_with_client, send_message_with_client, send_reaction_with_client,
 };
@@ -61,6 +62,11 @@ pub async fn delete_message(chat_id: &str, message_id: &str) -> Result<()> {
 /// Add (or with `remove`, remove) an emoji reaction on one message.
 pub async fn react(chat_id: &str, message_id: &str, emoji: &str, remove: bool) -> Result<()> {
     chat::react(chat_id, message_id, emoji, remove).await
+}
+
+/// Leave one chat thread (native Teams API, DELETE own roster membership)
+pub async fn leave_chat(chat_id: &str) -> Result<()> {
+    chat::leave_chat(chat_id).await
 }
 
 /// Get current presence status
