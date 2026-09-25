@@ -8,6 +8,7 @@ mod planner;
 mod presence;
 mod recordings;
 mod teams;
+mod transcripts;
 
 use anyhow::Result;
 
@@ -23,6 +24,12 @@ pub use recordings::{
     RecordingInfo, RecordingSource, RECORDINGS_MAX_LIMIT,
 };
 pub use teams::TeamInfo;
+pub use transcripts::{
+    clamp_limit as transcripts_clamp_limit, is_transcript,
+    list_transcripts_data, parse_transcripts_response, search_transcripts_data,
+    sort_newest as sort_transcripts_newest, transcripts_children_path,
+    transcripts_search_path, TranscriptInfo, TranscriptSource, TRANSCRIPTS_MAX_LIMIT,
+};
 
 // Re-export ChannelInfo for use in TUI sidebar (currently consumed
 // only through TeamInfo.channels, but kept public for future callers).
