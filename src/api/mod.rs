@@ -1,6 +1,7 @@
 //! API client module for Microsoft Teams
 
 mod calendar;
+mod calweek;
 mod chat;
 pub mod client;
 mod graph;
@@ -29,6 +30,10 @@ pub use teams::ChannelInfo;
 pub use calendar::{
     calendar_view_path, list_upcoming_meetings_data, lobby_next, parse_calendar_view,
     parse_join_url,
+};
+pub use calweek::{
+    calweek_view_path, cancel_meeting_data, list_week_meetings_data, parse_created_event,
+    schedule_event_body, schedule_meeting_data, validate_schedule,
 };
 pub use chat::{list_chats_data, read_messages_data, send_message_with_client};
 pub use me::whoami_data;
