@@ -3,6 +3,7 @@
 mod chat;
 pub mod client;
 mod files;
+mod filesearch;
 mod graph;
 mod me;
 mod presence;
@@ -34,6 +35,11 @@ pub use files::{
     list_chat_files_data_opts, list_file_versions_data, list_folder_children_data,
     move_body, move_file_data, rename_body, rename_file_data, restore_file_version_data,
     upload_file_data,
+};
+pub use filesearch::{
+    clamp_limit, drive_search_path, parse_drive_search_response,
+    parse_people_search_response, people_search_path, search_files_data,
+    search_people_data, FIND_MAX_LIMIT,
 };
 pub use me::whoami_data;
 pub use presence::get_presence_data;
@@ -96,6 +102,16 @@ pub async fn upload_file(chat_id: &str, local_path: &str) -> Result<()> {
 /// Create a view-only sharing link for a shared file
 pub async fn create_link(drive_id: &str, item_id: &str, scope: &str) -> Result<()> {
     files::create_link(drive_id, item_id, scope).await
+}
+
+/// Search OneDrive files by name/content (om-jb-filesearch)
+pub async fn search_files(query: &str, limit: usize) -> Result<()> {
+    filesearch::search_files(query, limit).await
+}
+
+/// Search the directory for people (om-jb-filesearch)
+pub async fn search_people(query: &str, limit: usize) -> Result<()> {
+    filesearch::search_people(query, limit).await
 }
 
 /// List one team's roster (members + owners; `owners_only` filters)

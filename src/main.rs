@@ -116,6 +116,26 @@ enum Commands {
         scope: String,
     },
 
+    /// Search OneDrive files by name/content (om-jb-filesearch)
+    FileSearch {
+        /// Free-text query
+        query: String,
+
+        /// Maximum number of files to show
+        #[arg(short, long, default_value = "25")]
+        limit: usize,
+    },
+
+    /// Search the directory for people (om-jb-filesearch)
+    PeopleSearch {
+        /// Free-text query (matches display name)
+        query: String,
+
+        /// Maximum number of people to show
+        #[arg(short, long, default_value = "25")]
+        limit: usize,
+    },
+
     /// Team roster (Graph /teams/{id}/members).
     /// Bare: list members + owners. --owners: owners only.
     /// --add <user-id-or-upn> [--owner]: add. --remove <membership-id>: remove.
@@ -270,6 +290,14 @@ async fn main() -> Result<()> {
             scope,
         } => {
             api::create_link(&drive_id, &item_id, &scope).await?;
+        }
+        Commands::FileSearch { query, limit } => {
+            tracing::info!("Searching files...");
+            api::search_files(&query, limit).await?;
+        }
+        Commands::PeopleSearch { query, limit } => {
+            tracing::info!("Searching people...");
+            api::search_people(&query, limit).await?;
         }
         Commands::Members {
             team,
