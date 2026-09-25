@@ -93,6 +93,24 @@ enum Commands {
         message_id: String,
     },
 
+    /// Add an emoji reaction to a message (one of 👍 ❤️ 😂 😮 😢 😠)
+    React {
+        /// Chat thread ID (from `chats` output)
+        #[arg(short, long)]
+        to: String,
+
+        /// Server message id (from `read` JSON via library)
+        #[arg(long)]
+        message_id: String,
+
+        /// Picker emoji (e.g. 👍)
+        emoji: String,
+
+        /// Remove instead of add
+        #[arg(long)]
+        remove: bool,
+    },
+
     /// List joined teams and their channels
     Teams,
 
@@ -229,6 +247,14 @@ async fn main() -> Result<()> {
         Commands::Delete { to, message_id } => {
             tracing::info!("Deleting message...");
             api::delete_message(&to, &message_id).await?;
+        }
+        Commands::React {
+            to,
+            message_id,
+            emoji,
+            remove,
+        } => {
+            api::react(&to, &message_id, &emoji, remove).await?;
         }
         Commands::Trouter => {
             trouter::connect_and_run().await?;
