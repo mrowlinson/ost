@@ -18,6 +18,7 @@ pub use files::{FileVersion, SharedFile};
 pub use me::UserInfo;
 pub use presence::PresenceInfo;
 pub use teams::TeamInfo;
+pub use teams::TeamMemberInfo;
 
 // Re-export ChannelInfo for use in TUI sidebar (currently consumed
 // only through TeamInfo.channels, but kept public for future callers).
@@ -36,7 +37,11 @@ pub use files::{
 };
 pub use me::whoami_data;
 pub use presence::get_presence_data;
-pub use teams::list_teams_data;
+pub use teams::{
+    add_member_body, add_team_member_data, create_channel_body, create_channel_data,
+    create_channel_path, join_team_data, list_team_members_data, list_teams_data, member_path,
+    members_path, remove_team_member_data,
+};
 
 /// List recent chats (native Teams API)
 pub async fn list_chats(limit: usize) -> Result<()> {
@@ -91,4 +96,19 @@ pub async fn upload_file(chat_id: &str, local_path: &str) -> Result<()> {
 /// Create a view-only sharing link for a shared file
 pub async fn create_link(drive_id: &str, item_id: &str, scope: &str) -> Result<()> {
     files::create_link(drive_id, item_id, scope).await
+}
+
+/// List one team's roster (members + owners; `owners_only` filters)
+pub async fn list_team_members(team_id: &str, owners_only: bool) -> Result<()> {
+    teams::list_team_members(team_id, owners_only).await
+}
+
+/// Add one user to a team (`owner` grants the owner role)
+pub async fn add_team_member(team_id: &str, user: &str, owner: bool) -> Result<()> {
+    teams::add_team_member(team_id, user, owner).await
+}
+
+/// Remove one membership from a team
+pub async fn remove_team_member(team_id: &str, member_id: &str) -> Result<()> {
+    teams::remove_team_member(team_id, member_id).await
 }

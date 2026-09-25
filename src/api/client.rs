@@ -163,6 +163,7 @@ impl TeamsClient {
 
     /// DELETE request to Microsoft Graph API (Bearer [REDACTED] with Graph token).
     /// DriveItem delete removes the item (204, no body).
+    /// OstMac (om-h5-members): also used for team member removal.
     pub async fn graph_delete(&self, path: &str) -> Result<reqwest::Response> {
         let token = self.graph_token()?;
         let url = format!("{}{}", GRAPH_BASE, path);
