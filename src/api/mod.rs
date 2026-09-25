@@ -7,6 +7,7 @@ pub mod client;
 mod graph;
 mod me;
 mod presence;
+mod schedule;
 mod teams;
 
 use anyhow::Result;
@@ -38,6 +39,10 @@ pub use calweek::{
 pub use chat::{list_chats_data, read_messages_data, send_message_with_client};
 pub use me::whoami_data;
 pub use presence::get_presence_data;
+pub use schedule::{
+    list_schedule_data, list_shifts_data, list_timeoff_reasons_data, list_timesoffs_data,
+    ScheduleInfo, ShiftInfo, TimeOffInfo, TimeOffReason,
+};
 pub use teams::list_teams_data;
 
 /// List recent chats (native Teams API)
@@ -78,4 +83,9 @@ pub async fn list_teams() -> Result<()> {
 /// List upcoming meetings (Graph calendarView, next 7 days)
 pub async fn list_upcoming_meetings(limit: usize) -> Result<()> {
     calendar::list_upcoming_meetings(limit).await
+}
+
+/// Print one team's schedule week grid (shifts + time-off, read-only)
+pub async fn list_shifts(team_id: &str) -> Result<()> {
+    schedule::list_shifts(team_id).await
 }
