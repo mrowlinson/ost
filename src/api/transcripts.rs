@@ -1,6 +1,6 @@
 //! Meeting transcripts in OneDrive + SharePoint (Graph driveItems).
 //!
-//! OstMac (om-transcripts-build): one searchable list of every meeting
+//! One searchable list of every meeting
 //! transcript the user can access, with speaker-turn display. Teams
 //! stores non-channel meeting transcripts in the organizer's OneDrive
 //! `Recordings` folder (`.vtt` next to the `.mp4`) and channel-meeting
@@ -8,13 +8,13 @@
 //! folder; both are plain `.vtt` driveItems, so list/download reuse
 //! the files-stack shapes.
 //!
-//! Recordings-lane clone: same Graph paths, same bounded channel
+//! Mirrors the recordings module: same Graph paths, same bounded channel
 //! fan-out, `.vtt` filter instead of the video filter. VTT bytes ride
 //! the existing files download (`/drives/{d}/items/{i}/content`);
-//! cue parsing is pure Swift (`TranscriptsParser.swift`).
+//! cue parsing is left to the caller.
 //!
-//! Docs grounding (Microsoft Graph v1.0; B2-transcripts P2/P3 live
-//! probes returned 200 + empty on this tenant):
+//! Docs grounding (Microsoft Graph v1.0; endpoints verified live,
+//! 200 + empty on a test tenant):
 //! - OneDrive folder children:
 //!   `GET /me/drive/root:/Recordings:/children?$top=N`
 //!   (missing folder 404s -> empty list, never an error)
@@ -26,10 +26,10 @@
 //!
 //! Auth: existing Graph token (`/.default`). No scope widening. The
 //! Graph transcript API path (`OnlineMeetingTranscript.Read.All`)
-//! is DROPPED (owner: admin consent will not happen); this module is
+//! is not used (it needs tenant admin consent); this module is
 //! drive-backed only. A 403 surfaces as the call's detail.
 //!
-//! `.docx` twin: the build lane live-probed own OneDrive and found
+//! `.docx` twin: a live probe of a OneDrive found
 //! zero Teams-written transcript twins (7 unrelated `.docx`, none in
 //! `Recordings`, none transcript-named) → `.vtt`-only. One predicate
 //! line re-adds `.docx` if that ever changes.
@@ -191,7 +191,7 @@ impl TranscriptSource {
 
 /// One meeting transcript (driveItem projection for list/search).
 /// VTT bytes download via the existing files download (`drive_id` +
-/// `id`); cue parsing is pure Swift.
+/// `id`); cue parsing is left to the caller.
 pub struct TranscriptInfo {
     pub id: String,
     pub name: String,
