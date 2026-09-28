@@ -396,6 +396,94 @@ pub async fn create_one_to_one_chat_data(
 }
 
 // ---------------------------------------------------------------------------
+// Group chat create
+// ---------------------------------------------------------------------------
+
+/// `POST /chats` path for group creation. Pure so tests pin it.
+pub fn group_chat_create_path() -> &'static str {
+    "/chats"
+}
+
+/// Trim, drop blanks, and de-duplicate user refs (case-insensitive,
+/// first spelling wins); `self_id` is removed (it is added as the
+/// creator). Pure so tests pin it.
+pub fn group_chat_members(self_id: &str, users: &[String]) -> Vec<String> {
+    let me = self_id.trim().to_lowercase();
+    let mut out: Vec<String> = Vec::new();
+    for u in users {
+        let t = u.trim();
+        if t.is_empty() || t.to_lowercase() == me {
+            continue;
+        }
+        if out.iter().any(|x| x.eq_ignore_ascii_case(t)) {
+            continue;
+        }
+        out.push(t.to_string());
+    }
+    out
+}
+
+/// `POST /chats` body for a group chat: the creator first, then every
+/// peer, all with the `owner` role (Graph's group-chat member role);
+/// blank topics are omitted. `users` must already be normalized
+/// ([`group_chat_members`]). Pure so tests pin it.
+pub fn group_chat_create_body(
+    self_id: &str,
+    users: &[String],
+    topic: Option<&str>,
+) -> serde_json::Value {
+    let member = |u: &str| {
+        serde_json::json!({
+            "@odata.type": "#microsoft.graph.aadUserConversationMember",
+            "roles": ["owner"],
+            "user@odata.bind": format!("https://graph.microsoft.com/v1.0/users('{}')", u.trim()),
+        })
+    };
+    let mut members = vec![member(self_id)];
+    members.extend(users.iter().map(|u| member(u)));
+    let mut body = serde_json::json!({
+        "chatType": "group",
+        "members": members,
+    });
+    if let Some(t) = topic.map(str::trim).filter(|t| !t.is_empty()) {
+        body["topic"] = serde_json::Value::String(t.to_string());
+    }
+    body
+}
+
+/// Create a group chat with `users` (AAD ids or UPNs) plus the signed-in
+/// user, with an optional topic, via Graph `POST /chats`. At least one
+/// peer is required (checked before any network); the server enforces
+/// its own minimums. Returns the new thread (`is_group` true).
+pub async fn create_group_chat_data(
+    client: &TeamsClient,
+    users: &[String],
+    topic: Option<&str>,
+) -> Result<ChatInfo> {
+    if group_chat_members("", users).is_empty() {
+        bail!("no members");
+    }
+    let me = whoami_data(client).await?;
+    let peers = group_chat_members(&me.id, users);
+    if peers.is_empty() {
+        bail!("no members besides self");
+    }
+    let resp = client
+        .graph_post(
+            group_chat_create_path(),
+            &group_chat_create_body(&me.id, &peers, topic),
+        )
+        .await?;
+    let value: serde_json::Value = resp
+        .json()
+        .await
+        .context("Failed to parse created chat response")?;
+    let mut chat = parse_created_chat(&value)?;
+    chat.is_group = true;
+    Ok(chat)
+}
+
+// ---------------------------------------------------------------------------
 // Reactions (OstMac om-reactions lane)
 // ---------------------------------------------------------------------------
 //
@@ -997,5 +1085,29 @@ src="x">"#));
         let bare: NativeMessage =
             serde_json::from_str(r#"{"id":"1","content":"<p>hi</p>"}"#).unwrap();
         assert!(message_reactions(&bare).is_empty());
+    }
+
+    #[test]
+    fn group_chat_body_and_member_normalization() {
+        let users = vec![
+            " b@x.com ".to_string(),
+            "".to_string(),
+            "B@X.com".to_string(),
+            "me-oid".to_string(),
+            "c-oid".to_string(),
+        ];
+        let peers = group_chat_members("ME-OID", &users);
+        assert_eq!(peers, vec!["b@x.com".to_string(), "c-oid".to_string()]);
+        assert_eq!(group_chat_create_path(), "/chats");
+        let b = group_chat_create_body("me-oid", &peers, Some("  Launch  "));
+        assert_eq!(b["chatType"], "group");
+        assert_eq!(b["topic"], "Launch");
+        let m = b["members"].as_array().unwrap();
+        assert_eq!(m.len(), 3);
+        assert_eq!(m[0]["user@odata.bind"], "https://graph.microsoft.com/v1.0/users('me-oid')");
+        assert_eq!(m[2]["user@odata.bind"], "https://graph.microsoft.com/v1.0/users('c-oid')");
+        assert!(m.iter().all(|x| x["roles"][0] == "owner"));
+        assert!(group_chat_create_body("me", &peers, Some("  ")).get("topic").is_none());
+        assert!(group_chat_create_body("me", &peers, None).get("topic").is_none());
     }
 }

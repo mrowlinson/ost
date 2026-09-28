@@ -23,7 +23,8 @@ pub use teams::ChannelInfo;
 
 // Re-export data-returning functions for TUI integration
 pub use chat::{
-    create_one_to_one_chat_data, delete_message_with_client, edit_message_body,
+    create_group_chat_data, create_one_to_one_chat_data, delete_message_with_client,
+    group_chat_create_body, group_chat_create_path, group_chat_members, edit_message_body,
     edit_message_with_client, emoji_for_reaction_type, leave_chat_with_client, leave_member_url,
     list_chats_data, message_url, one_to_one_create_body, one_to_one_create_path,
     own_member_mri, parse_created_chat, reaction_add_body, reaction_add_url, reaction_remove_url,
