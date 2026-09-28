@@ -32,7 +32,7 @@ pub use teams::list_teams_data;
 #[allow(unused_imports)]
 pub use todo::{
     complete_todo_task_data, create_todo_task_data, list_todo_lists_data,
-    list_todo_tasks_data,
+    list_todo_tasks_data, reopen_todo_task_data,
 };
 
 /// List recent chats (native Teams API)
