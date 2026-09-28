@@ -29,10 +29,43 @@
 //! is not used (it needs tenant admin consent); this module is
 //! drive-backed only. A 403 surfaces as the call's detail.
 //!
-//! `.docx` twin: a live probe of a OneDrive found
-//! zero Teams-written transcript twins (7 unrelated `.docx`, none in
-//! `Recordings`, none transcript-named) → `.vtt`-only. One predicate
-//! line re-adds `.docx` if that ever changes.
+//! `.docx` twin (transcripts-fix lane): the build lane live-probed
+//! own OneDrive and found zero Teams-written transcript twins (7
+//! unrelated `.docx`, none in `Recordings`, none transcript-named).
+//! The fix lane re-adds `.docx`/`.doc` NARROWLY: only when the stem
+//! contains `transcript` (case-insensitive; covers `transcription`),
+//! so those 7 unrelated files still filter out. Exact rules live on
+//! [`is_transcript`].
+//!
+//! Full-drive search fallback (transcripts-fix lane): meetings the
+//! user did NOT organize keep their `.vtt`/transcript-`.docx` in the
+//! organizer's OneDrive — unreachable from the signed-in drive (see
+//! HONEST GAP below). But transcript-ish files can also sit OUTSIDE
+//! `Recordings` on reachable drives (renames, moves, non-Teams
+//! writers). When the folder scan finds zero rows,
+//! [`list_transcripts_data`] falls back to drive-search windows (see
+//! [`FALLBACK_QUERY_ONEDRIVE_VTT`], [`FALLBACK_QUERY_TRANSCRIPT`]):
+//! 2 queries on OneDrive + `transcript` on each resolved channel
+//! drive, parsed by the same predicate, deduped. Bounded, and only
+//! on empty folder scans (the common hit path pays zero extra).
+//!
+//! HONEST GAP (organizer-owned transcripts): non-channel meetings
+//! store the transcript in the ORGANIZER's OneDrive `Recordings`
+//! folder. The signed-in user's drive search cannot see another
+//! user's drive, and the Graph transcript API
+//! (`GET /me/onlineMeetings/{id}/transcripts`, app permission
+//! `OnlineMeetingTranscript.Read.All`) needs tenant-admin consent,
+//! which the owner DECLINED. So: transcripts of meetings organized
+//! by someone else are unreachable from this module, by design.
+//! The empty state says so (Swift side); nothing here retries or
+//! fabricates them.
+//!
+//! Cost of the raised caps (transcripts-fix lane): worst case per
+//! list call is 1 teams scan + 100 filesFolder lookups + 100 folder
+//! scans + 100 Recordings lists = ~301 requests (was ~151 at the
+//! 50/50 caps), all sequential, each small JSON. The search path is
+//! 1 OneDrive search + 100 drive searches. The fallback adds at most
+//! 2 + 100 requests and only fires on empty folder scans.
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
@@ -44,13 +77,27 @@ use super::client::TeamsClient;
 pub const TRANSCRIPTS_FOLDER: &str = "Recordings";
 
 /// Per-request result cap for list + search windows.
-pub const TRANSCRIPTS_MAX_LIMIT: usize = 50;
+/// Raised 50 -> 100 by the transcripts-fix lane (channel-heavy
+/// tenants truncated at 50; cost is one `$top=100` window per drive).
+pub const TRANSCRIPTS_MAX_LIMIT: usize = 100;
 
 /// Upper bound on channel drives fanned out to (list + search stay
 /// one teams scan plus bounded folder/search windows).
-pub const MAX_CHANNEL_DRIVES: usize = 50;
+/// Raised 50 -> 100 by the transcripts-fix lane: tenants with more
+/// than 50 channels silently lost transcript folders. Worst-case
+/// cost per list call roughly doubles (~151 -> ~301 small
+/// sequential requests; see the module docs).
+pub const MAX_CHANNEL_DRIVES: usize = 100;
 
-/// Clamp a result limit into the `1..=50` window.
+/// Fallback drive-search queries (transcripts-fix lane): when the
+/// `Recordings`-folder scan finds zero rows, the list falls back to
+/// full-drive search so transcript-ish files OUTSIDE `Recordings`
+/// still surface. `.vtt` catches bare caption files; `transcript`
+/// catches Teams transcript twins (`*transcript*.docx`) by name.
+pub const FALLBACK_QUERY_ONEDRIVE_VTT: &str = ".vtt";
+pub const FALLBACK_QUERY_TRANSCRIPT: &str = "transcript";
+
+/// Clamp a result limit into the `1..=100` window.
 pub fn clamp_limit(limit: usize) -> usize {
     limit.clamp(1, TRANSCRIPTS_MAX_LIMIT)
 }
@@ -204,11 +251,18 @@ pub struct TranscriptInfo {
     pub source: TranscriptSource,
 }
 
-/// True when a driveItem name/mime looks like a transcript: a `.vtt`
-/// extension (any case) or the `text/vtt` mime. Graph sometimes omits
-/// the mime (or reports `text/plain` for `.vtt`), so the extension is
-/// the primary signal; the mime alone also accepts. Pure so list,
-/// search, and tests share it.
+/// True when a driveItem name/mime looks like a transcript.
+/// Exact rules (transcripts-fix lane):
+/// 1. `.vtt` extension (any case) accepts, whatever the mime
+///    (Graph sometimes omits it or reports `text/plain`).
+/// 2. `text/vtt` mime (case-insensitive) accepts, whatever the
+///    name (extensionless caption files).
+/// 3. `.docx`/`.doc` extension (any case) accepts ONLY when the
+///    stem (name minus extension) contains `transcript`
+///    (case-insensitive; covers `transcription`). The Word mime
+///    alone does NOT accept: the build lane found 7 unrelated
+///    `.docx` on the drive, and this name gate keeps them out.
+/// Pure so list, search, fallback, and tests share it.
 pub fn is_transcript(name: &str, mime: Option<&str>) -> bool {
     if let Some(m) = mime {
         if m.to_ascii_lowercase() == "text/vtt" {
@@ -216,7 +270,17 @@ pub fn is_transcript(name: &str, mime: Option<&str>) -> bool {
         }
     }
     let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
-    ext == "vtt"
+    if ext == "vtt" {
+        return true;
+    }
+    if ext == "docx" || ext == "doc" {
+        let stem = match name.rfind('.') {
+            Some(i) => &name[..i],
+            None => name,
+        };
+        return stem.to_ascii_lowercase().contains("transcript");
+    }
+    false
 }
 
 fn transcript_from_item(item: DriveItem, source: TranscriptSource) -> Option<TranscriptInfo> {
@@ -345,10 +409,23 @@ async fn channel_drives(client: &TeamsClient) -> Vec<ChannelDrive> {
 // List + search
 // ---------------------------------------------------------------------------
 
+/// Drop duplicate rows by (`drive_id`, `id`): the search fallback
+/// can return the same item twice (`.vtt` + `transcript` windows
+/// overlap). First occurrence wins; order otherwise preserved. Pure
+/// so tests pin it.
+pub fn dedupe_transcripts(rows: &mut Vec<TranscriptInfo>) {
+    let mut seen = std::collections::HashSet::new();
+    rows.retain(|r| seen.insert((r.drive_id.clone(), r.id.clone())));
+}
+
 /// List every meeting transcript: the OneDrive `Recordings` folder plus
 /// each channel's `Recordings` folder, newest first, truncated to
 /// `limit`. Missing folders (404) and per-channel failures read as
-/// empty; only a total failure (no drive answered) errors.
+/// empty; only a total failure (no drive answered) errors. When the
+/// folder scan finds ZERO rows, a bounded full-drive search fallback
+/// fires (OneDrive `.vtt` + `transcript`, `transcript` per channel
+/// drive) so transcript-ish files outside `Recordings` still surface;
+/// organizer-owned drives stay unreachable (see the module HONEST GAP).
 pub async fn list_transcripts_data(
     client: &TeamsClient,
     limit: usize,
@@ -376,7 +453,9 @@ pub async fn list_transcripts_data(
     }
 
     // Channel folders: scan each filesFolder for a `Recordings` dir.
-    for drive in channel_drives(client).await {
+    // (Drives resolve once; the fallback below reuses them.)
+    let drives = channel_drives(client).await;
+    for drive in &drives {
         let source = TranscriptSource::Channel {
             team: drive.team.clone(),
             channel: drive.channel.clone(),
@@ -425,13 +504,69 @@ pub async fn list_transcripts_data(
     if !answered {
         bail!("no drive answered the transcripts list");
     }
+
+    // Empty folder scan -> bounded full-drive search fallback
+    // (transcripts-fix lane). OneDrive gets both fallback queries
+    // (`.vtt` catches bare caption files anywhere; `transcript`
+    // catches transcript twins by name); each channel drive gets the
+    // `transcript` query only (channel `.vtt` stragglers outside
+    // `Recordings` are rare; this halves the fallback fan-out).
+    // Same predicate, same parse; failures read as empty.
+    if all.is_empty() {
+        for q in [FALLBACK_QUERY_ONEDRIVE_VTT, FALLBACK_QUERY_TRANSCRIPT] {
+            match client.graph_get(&transcripts_search_path(None, q, limit)).await {
+                Ok(resp) => match resp.json().await {
+                    Ok(v) => {
+                        let v: serde_json::Value = v;
+                        all.extend(parse_transcripts_response(&v, TranscriptSource::OneDrive));
+                    }
+                    Err(e) => {
+                        tracing::warn!("Transcripts fallback parse failed: {:#}", e);
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!("Transcripts fallback search failed: {:#}", e);
+                }
+            }
+        }
+        for drive in &drives {
+            let source = TranscriptSource::Channel {
+                team: drive.team.clone(),
+                channel: drive.channel.clone(),
+            };
+            match client
+                .graph_get(&transcripts_search_path(
+                    Some(&drive.drive_id),
+                    FALLBACK_QUERY_TRANSCRIPT,
+                    limit,
+                ))
+                .await
+            {
+                Ok(resp) => match resp.json().await {
+                    Ok(v) => {
+                        let v: serde_json::Value = v;
+                        all.extend(parse_transcripts_response(&v, source));
+                    }
+                    Err(e) => {
+                        tracing::warn!("Transcripts fallback parse failed: {:#}", e);
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!("Transcripts fallback search failed: {:#}", e);
+                }
+            }
+        }
+        dedupe_transcripts(&mut all);
+    }
+
     sort_newest(&mut all);
     all.truncate(limit);
     Ok(all)
 }
 
 /// Search every transcript by name: the OneDrive drive-search plus one
-/// drive-search per channel drive, `.vtt`-filtered, newest first,
+/// drive-search per channel drive, predicate-filtered (`.vtt` +
+/// transcript `.docx`; see [`is_transcript`]), newest first,
 /// truncated to `limit`. Empty queries are rejected before any
 /// network.
 pub async fn search_transcripts_data(
@@ -495,31 +630,55 @@ mod tests {
     fn limit_clamps_to_window() {
         assert_eq!(clamp_limit(0), 1);
         assert_eq!(clamp_limit(25), 25);
-        assert_eq!(clamp_limit(50), 50);
-        assert_eq!(clamp_limit(500), 50);
+        assert_eq!(clamp_limit(100), 100);
+        assert_eq!(clamp_limit(500), 100);
+    }
+
+    #[test]
+    fn caps_are_raised_fix_lane_values() {
+        // transcripts-fix lane: 50 -> 100 on both caps.
+        assert_eq!(TRANSCRIPTS_MAX_LIMIT, 100);
+        assert_eq!(MAX_CHANNEL_DRIVES, 100);
     }
 
     #[test]
     fn children_path_shape_matches_graph_contract() {
         assert_eq!(
-            transcripts_children_path(99),
-            "/me/drive/root:/Recordings:/children?$top=50"
+            transcripts_children_path(999),
+            "/me/drive/root:/Recordings:/children?$top=100"
         );
     }
 
     #[test]
     fn search_paths_shape_matches_graph_contract() {
         assert_eq!(
-            transcripts_search_path(None, ".vtt", 99),
-            "/me/drive/search(q='.vtt')?$top=50"
+            transcripts_search_path(None, ".vtt", 999),
+            "/me/drive/search(q='.vtt')?$top=100"
         );
         assert_eq!(
-            transcripts_search_path(None, "q3 review", 99),
-            "/me/drive/search(q='q3%20review')?$top=50"
+            transcripts_search_path(None, "q3 review", 999),
+            "/me/drive/search(q='q3%20review')?$top=100"
         );
         assert_eq!(
             transcripts_search_path(Some("d9"), "tom's", 10),
             "/drives/d9/root/search(q='tom%27%27s')?$top=10"
+        );
+    }
+
+    #[test]
+    fn fallback_queries_pin_search_paths() {
+        // The list fallback fires these exact windows on empty scans.
+        assert_eq!(
+            transcripts_search_path(None, FALLBACK_QUERY_ONEDRIVE_VTT, 100),
+            "/me/drive/search(q='.vtt')?$top=100"
+        );
+        assert_eq!(
+            transcripts_search_path(None, FALLBACK_QUERY_TRANSCRIPT, 100),
+            "/me/drive/search(q='transcript')?$top=100"
+        );
+        assert_eq!(
+            transcripts_search_path(Some("d9"), FALLBACK_QUERY_TRANSCRIPT, 100),
+            "/drives/d9/root/search(q='transcript')?$top=100"
         );
     }
 
@@ -542,14 +701,34 @@ mod tests {
         assert!(is_transcript("a.VTT", Some("text/plain"))); // Graph reality
         assert!(is_transcript("noext", Some("text/vtt"))); // mime fallback
         assert!(!is_transcript("clip.mp4", Some("video/mp4")));
-        assert!(!is_transcript("notes.docx", None)); // vtt-only: no docx twin
         assert!(!is_transcript("notes.pdf", Some("application/pdf")));
         assert!(!is_transcript("a.vtt.txt", None)); // trailing ext wins
         assert!(!is_transcript("noext", None));
     }
 
     #[test]
-    fn parse_keeps_vtt_skips_rest() {
+    fn is_transcript_accepts_transcript_docx_only() {
+        // Fix lane rule 3: docx/doc + `transcript` in the stem.
+        assert!(is_transcript("Weekly Sync transcript.docx", None));
+        assert!(is_transcript(
+            "Weekly Sync transcript.docx",
+            Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        ));
+        assert!(is_transcript("Meeting TRANSCRIPTION.doc", None)); // case + -ion
+        assert!(is_transcript("a.DOCX", Some("text/vtt"))); // rule 2 still wins
+        // The build lane's 7 unrelated .docx still filter out:
+        assert!(!is_transcript("notes.docx", None));
+        assert!(!is_transcript(
+            "notes.docx",
+            Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        )); // Word mime alone is NOT enough
+        assert!(!is_transcript("notes.doc", None));
+        assert!(!is_transcript("transcript", None)); // no ext, no mime
+        assert!(!is_transcript("transcript.pdf", None)); // wrong ext
+    }
+
+    #[test]
+    fn parse_keeps_transcripts_skips_rest() {
         let value = json!({
             "value": [
                 {"id": "t1", "name": "Weekly Sync-20260924.vtt", "size": 4211,
@@ -557,6 +736,9 @@ mod tests {
                  "createdDateTime": "2026-09-24T09:00:00Z",
                  "lastModifiedDateTime": "2026-09-24T10:00:00Z",
                  "file": {"mimeType": "text/vtt"},
+                 "parentReference": {"driveId": "d1"}},
+                {"id": "t2", "name": "Q3 Review transcript.docx", "size": 9001,
+                 "file": {"mimeType": "application/vnd.openxmlformats-officedocument.wordprocessingml.document"},
                  "parentReference": {"driveId": "d1"}},
                 {"id": "r1", "name": "Weekly Sync-20260924.mp4", "size": 48211,
                  "file": {"mimeType": "video/mp4"}},
@@ -567,12 +749,41 @@ mod tests {
             ]
         });
         let rows = parse_transcripts_response(&value, TranscriptSource::OneDrive);
-        assert_eq!(rows.len(), 1);
+        assert_eq!(rows.len(), 2);
         let t = &rows[0];
         assert_eq!(t.name, "Weekly Sync-20260924.vtt");
         assert_eq!(t.size, 4211);
         assert_eq!(t.drive_id.as_deref(), Some("d1"));
         assert_eq!(t.source.label(), "OneDrive");
+        assert_eq!(rows[1].name, "Q3 Review transcript.docx");
+    }
+
+    #[test]
+    fn dedupe_drops_same_drive_and_id() {
+        fn row(id: &str, drive: Option<&str>, name: &str) -> TranscriptInfo {
+            TranscriptInfo {
+                id: id.into(),
+                name: name.into(),
+                size: 0,
+                mime: None,
+                web_url: None,
+                drive_id: drive.map(str::to_string),
+                created: None,
+                modified: None,
+                source: TranscriptSource::OneDrive,
+            }
+        }
+        let mut rows = vec![
+            row("t1", Some("d1"), "a.vtt"),
+            row("t1", Some("d1"), "a.vtt"), // fallback double-hit
+            row("t1", Some("d2"), "a.vtt"), // same id, other drive: kept
+            row("t2", Some("d1"), "b.vtt"),
+        ];
+        dedupe_transcripts(&mut rows);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].drive_id.as_deref(), Some("d1"));
+        assert_eq!(rows[1].drive_id.as_deref(), Some("d2"));
+        assert_eq!(rows[2].id, "t2");
     }
 
     #[test]
