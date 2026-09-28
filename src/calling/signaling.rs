@@ -17,7 +17,7 @@ pub(crate) const TEAMS_RING: &str = "general";
 /// Teams cloud region for the `ms-teams-*` request headers.
 ///
 /// Defaults to the AMER cloud; non-default values ride on
-/// `ConversationCallParams::region`, sourced from `from_env_or_default`
+/// `ConversationCallParams::region`, sourced from `from_config_or_env`
 /// at the call-placement entry points.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TeamsRegion {
@@ -62,6 +62,34 @@ impl TeamsRegion {
             std::env::var("TEAMS_PARTITION").ok(),
             std::env::var("TEAMS_REGION").ok(),
             std::env::var("TEAMS_RING").ok(),
+        )
+    }
+
+    /// Region from the config file's `teams_partition`/`teams_region`/
+    /// `teams_ring` fields, falling back to the AMER default per field.
+    ///
+    /// Pure (no env read) so tests stay hermetic.
+    pub fn from_config(config: &crate::config::Config) -> Self {
+        Self::with_overrides(
+            config.teams_partition.clone(),
+            config.teams_region.clone(),
+            config.teams_ring.clone(),
+        )
+    }
+
+    /// Region with per-field precedence: `TEAMS_PARTITION`/`TEAMS_REGION`/
+    /// `TEAMS_RING` env vars win (mirrors the `TEAMS_EPCONV_URL` override
+    /// pattern for region testing), then the config file, then the AMER
+    /// default. Entry points use this so a persisted non-AMER region
+    /// applies while ad-hoc env overrides still work.
+    pub fn from_config_or_env(config: &crate::config::Config) -> Self {
+        let base = Self::from_config(config);
+        Self::with_overrides(
+            std::env::var("TEAMS_PARTITION")
+                .ok()
+                .or(Some(base.partition)),
+            std::env::var("TEAMS_REGION").ok().or(Some(base.region)),
+            std::env::var("TEAMS_RING").ok().or(Some(base.ring)),
         )
     }
 }
@@ -1354,5 +1382,25 @@ mod tests {
         assert_eq!(h.get("ms-teams-partition").unwrap(), "euwe01");
         assert_eq!(h.get("ms-teams-region").unwrap(), "euwe");
         assert_eq!(h.get("ms-teams-ring").unwrap(), "general");
+    }
+
+    #[test]
+    fn config_region_applies_per_field_over_default() {
+        use crate::config::Config;
+        let empty = Config::default();
+        assert_eq!(TeamsRegion::from_config(&empty), TeamsRegion::default());
+
+        let mut eu = Config::default();
+        eu.teams_partition = Some("euwe01".to_string());
+        eu.teams_region = Some("euwe".to_string());
+        let r = TeamsRegion::from_config(&eu);
+        assert_eq!(r.partition, "euwe01");
+        assert_eq!(r.region, "euwe");
+        assert_eq!(r.ring, "general");
+
+        // Config values reach the wire headers.
+        let h = headers_for(&r);
+        assert_eq!(h.get("ms-teams-partition").unwrap(), "euwe01");
+        assert_eq!(h.get("ms-teams-region").unwrap(), "euwe");
     }
 }
