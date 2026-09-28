@@ -101,14 +101,54 @@ pub async fn list_tabs(channel_id: &str) -> Result<()> {
 
     println!("\nChannel Tabs:");
     println!("{:-<60}", "");
+    print_tabs(&tabs);
+    Ok(())
+}
+
+fn print_tabs(tabs: &[TabInfo]) {
     if tabs.is_empty() {
         println!("  (no tabs found)");
-        return Ok(());
+        return;
     }
-    for t in &tabs {
+    for t in tabs {
         println!("  {:<30} {}", t.name, t.id);
         if let Some(ref u) = t.website_url.as_ref().or(t.content_url.as_ref()) {
             println!("    {}", u);
+        }
+    }
+}
+
+// -- Tabs-all dump (single-auth, machine-splittable sections) --
+
+/// Section header for the tabs-all dump: `=== team | channel | id`.
+/// Team/channel names never contain `|` from Graph; consumers split on it.
+pub fn tabs_all_section_header(team: &str, channel: &str, channel_id: &str) -> String {
+    format!("=== {} | {} | {}", team, channel, channel_id)
+}
+
+/// Dump every joined channel's tabs (one auth, read-only). Same per-tab
+/// lines as `list_tabs`; sections split on `=== ` headers. One slow call
+/// (~1 Graph round-trip per channel) beats N CLI spawns (N auth setups).
+pub async fn list_tabs_all() -> Result<()> {
+    let client = TeamsClient::new().await?;
+    let teams = crate::api::list_teams_data(&client).await?;
+    for team in &teams {
+        for channel in &team.channels {
+            println!(
+                "{}",
+                tabs_all_section_header(&team.name, &channel.name, &channel.id)
+            );
+            let path = format!("/teams/{}/channels/{}/tabs", team.id, channel.id);
+            let resp = client.graph_get(&path).await?;
+            let parsed: TabsResponse =
+                resp.json().await.context("Failed to parse tabs response")?;
+            print_tabs(
+                &parsed
+                    .value
+                    .into_iter()
+                    .map(tab_from_wire)
+                    .collect::<Vec<_>>(),
+            );
         }
     }
     Ok(())
@@ -152,6 +192,14 @@ mod tests {
         );
         // Missing displayName falls back to the tab id.
         assert_eq!(tabs[4].name, "t-bare");
+    }
+
+    #[test]
+    fn section_header_round_trips_pipes() {
+        assert_eq!(
+            tabs_all_section_header("IS OPS", "General", "19:abc@thread.skype"),
+            "=== IS OPS | General | 19:abc@thread.skype"
+        );
     }
 
     #[test]

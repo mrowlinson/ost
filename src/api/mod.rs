@@ -68,3 +68,8 @@ pub async fn list_teams() -> Result<()> {
 pub async fn list_tabs(channel_id: &str) -> Result<()> {
     tabs::list_tabs(channel_id).await
 }
+
+/// Dump every joined channel's tabs (one auth, read-only)
+pub async fn list_tabs_all() -> Result<()> {
+    tabs::list_tabs_all().await
+}
