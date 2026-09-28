@@ -29,7 +29,7 @@ pub use chat::{list_chats_data, read_messages_data, send_message_with_client};
 #[allow(unused_imports)]
 pub use files::{
     download_file_data, folder_children_path, list_chat_files_data, list_chat_files_data_opts,
-    list_folder_children_data, upload_file_data,
+    list_folder_children_data, list_message_files_data, message_path, upload_file_data,
 };
 pub use me::whoami_data;
 pub use presence::get_presence_data;
