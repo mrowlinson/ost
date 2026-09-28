@@ -244,7 +244,27 @@ pub async fn join_conversation_with_sdp_video(
     sdp_offer: &str,
     video: bool,
 ) -> Result<ConversationJoined> {
-    let payload = join_conversation_payload(params, sdp_offer, video);
+    join_conversation_with_modalities(
+        http,
+        conversation_controller,
+        params,
+        sdp_offer,
+        &accepted_call_modalities(video),
+    )
+    .await
+}
+
+/// Phase 2 with explicit `callModalities` (see [`join_call_modalities`]):
+/// a receive-capable join declares what it can take (video, screen
+/// share); the SDP direction says what it sends.
+pub async fn join_conversation_with_modalities(
+    http: &reqwest::Client,
+    conversation_controller: &str,
+    params: &ConversationCallParams<'_>,
+    sdp_offer: &str,
+    modalities: &[&str],
+) -> Result<ConversationJoined> {
+    let payload = join_conversation_payload_with_modalities(params, sdp_offer, modalities);
 
     tracing::info!("Phase 2: POST {} (join with SDP)", conversation_controller);
     tracing::debug!(
@@ -299,6 +319,15 @@ pub fn join_conversation_payload(
     params: &ConversationCallParams<'_>,
     sdp_offer: &str,
     video: bool,
+) -> serde_json::Value {
+    join_conversation_payload_with_modalities(params, sdp_offer, &accepted_call_modalities(video))
+}
+
+/// The phase 2 join body with explicit `callInvitation.callModalities`.
+pub fn join_conversation_payload_with_modalities(
+    params: &ConversationCallParams<'_>,
+    sdp_offer: &str,
+    modalities: &[&str],
 ) -> serde_json::Value {
     let tc = |path: &str| trouter_callback(params.trouter_surl, params.endpoint_id, path);
     let cause_id = &params.message_id[..8.min(params.message_id.len())];
@@ -366,7 +395,7 @@ pub fn join_conversation_payload(
             }
         },
         "callInvitation": {
-            "callModalities": accepted_call_modalities(video),
+            "callModalities": modalities,
             "replaces": null,
             "transferor": null,
             "links": {
@@ -406,6 +435,21 @@ pub fn accepted_call_modalities(video: bool) -> Vec<&'static str> {
     } else {
         vec!["Audio"]
     }
+}
+
+/// Modalities a live group call / meeting join declares: `Audio`, plus
+/// `Video` when it receives video (camera on or off: the SDP direction
+/// carries the camera), plus `ScreenViewer` when its offer carries a
+/// screen share receive line (as the 1:1 and echo call bodies declare).
+pub fn join_call_modalities(video: bool, screen_viewer: bool) -> Vec<&'static str> {
+    let mut m = vec!["Audio"];
+    if video {
+        m.push("Video");
+    }
+    if screen_viewer {
+        m.push("ScreenViewer");
+    }
+    m
 }
 
 /// Accept an incoming call by POSTing to the acceptance URL (audio only).
@@ -1322,5 +1366,35 @@ mod tests {
         assert_eq!(video["callInvitation"]["mediaContent"]["blob"], "v=0\r\n");
         assert_eq!(video["groupChat"]["threadId"], "19:meeting_test@thread.v2");
         assert_eq!(video["debugContent"]["causeId"], "01234567");
+    }
+
+    #[test]
+    fn join_call_modalities_video_and_screen_viewer() {
+        assert_eq!(join_call_modalities(false, false), vec!["Audio"]);
+        assert_eq!(join_call_modalities(true, false), vec!["Audio", "Video"]);
+        assert_eq!(
+            join_call_modalities(true, true),
+            vec!["Audio", "Video", "ScreenViewer"]
+        );
+        assert_eq!(
+            join_call_modalities(false, true),
+            vec!["Audio", "ScreenViewer"]
+        );
+
+        let params = test_params();
+        let body = join_conversation_payload_with_modalities(
+            &params,
+            "v=0\r\n",
+            &join_call_modalities(true, true),
+        );
+        assert_eq!(
+            body["callInvitation"]["callModalities"],
+            serde_json::json!(["Audio", "Video", "ScreenViewer"])
+        );
+        // The bool entry point is unchanged.
+        assert_eq!(
+            join_conversation_payload(&params, "v=0\r\n", true),
+            join_conversation_payload_with_modalities(&params, "v=0\r\n", &["Audio", "Video"])
+        );
     }
 }
