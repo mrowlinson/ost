@@ -14,6 +14,9 @@
 //!   carrying the task's last known `@odata.etag`
 //!   (https://learn.microsoft.com/en-us/graph/api/plannertask-update).
 //!   Completion is `percentComplete`: 100 done, 0 reopened.
+//!   Assignment is `assignments`: `{userId: plannerAssignment}` adds,
+//!   `{userId: null}` removes
+//!   (https://learn.microsoft.com/en-us/graph/api/resources/plannerassignments).
 //!
 //! The `If-Match` PATCH goes through [`TeamsClient::graph_patch_etag`],
 //! which also sends `Prefer: return=representation` (docs: 200 + the
@@ -70,6 +73,8 @@ struct PlannerTask {
     due_date_time: Option<String>,
     #[serde(rename = "@odata.etag")]
     etag: Option<String>,
+    /// `assignments`: user id -> plannerAssignment (null = removed).
+    assignments: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 /// Reject ids that would break out of the Graph path segment.
@@ -128,6 +133,23 @@ pub fn set_complete_body(complete: bool) -> serde_json::Value {
     serde_json::json!({ "percentComplete": if complete { 100 } else { 0 } })
 }
 
+/// Assign (`assign=true`) or unassign one user. The id becomes a JSON
+/// key, so it gets the same guard as a path id.
+pub fn set_assignment_body(user_id: &str, assign: bool) -> Result<serde_json::Value> {
+    check_id("user_id", user_id)?;
+    let value = if assign {
+        serde_json::json!({
+            "@odata.type": "#microsoft.graph.plannerAssignment",
+            "orderHint": " !",
+        })
+    } else {
+        serde_json::Value::Null
+    };
+    let mut map = serde_json::Map::new();
+    map.insert(user_id.to_string(), value);
+    Ok(serde_json::json!({ "assignments": map }))
+}
+
 /// Create-task body. Empty titles are rejected before any network.
 pub fn create_task_body(plan_id: &str, bucket_id: &str, title: &str) -> Result<serde_json::Value> {
     check_id("plan_id", plan_id)?;
@@ -173,8 +195,11 @@ pub struct PlannerTaskInfo {
     pub priority: Option<i32>,
     /// `dueDateTime` verbatim, when set.
     pub due: Option<String>,
-    /// `@odata.etag` verbatim; required for complete/reopen.
+    /// `@odata.etag` verbatim; required for complete/reopen/assign.
     pub etag: String,
+    /// Assigned user ids (`assignments` keys with a non-null value),
+    /// sorted; empty when unassigned.
+    pub assignee_ids: Vec<String>,
 }
 
 fn plan_info(p: Plan) -> PlanInfo {
@@ -209,7 +234,21 @@ fn task_info(t: PlannerTask) -> PlannerTaskInfo {
         priority: t.priority,
         due: t.due_date_time,
         etag: t.etag.unwrap_or_default(),
+        assignee_ids: assignee_ids(t.assignments),
     }
+}
+
+/// `assignments` keys whose value is an object (a null value is a
+/// removal echo, never an assignee). Sorted for stable output.
+fn assignee_ids(map: Option<serde_json::Map<String, serde_json::Value>>) -> Vec<String> {
+    let mut ids: Vec<String> = map
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(k, v)| !k.trim().is_empty() && !v.is_null())
+        .map(|(k, _)| k)
+        .collect();
+    ids.sort();
+    ids
 }
 
 /// Parse a plans collection body (pure; powers tests + embedders).
@@ -291,10 +330,34 @@ pub async fn set_task_complete_data(
     etag: &str,
     complete: bool,
 ) -> Result<PlannerTaskInfo> {
+    patch_task(client, task_id, etag, &set_complete_body(complete)).await
+}
+
+/// Assign (`assign=true`) or unassign one user on one task and return
+/// the task. Same `If-Match` / refresh-first contract as
+/// [`set_task_complete_data`].
+pub async fn set_task_assignee_data(
+    client: &TeamsClient,
+    task_id: &str,
+    etag: &str,
+    user_id: &str,
+    assign: bool,
+) -> Result<PlannerTaskInfo> {
+    let body = set_assignment_body(user_id, assign)?;
+    patch_task(client, task_id, etag, &body).await
+}
+
+/// `PATCH /planner/tasks/{id}` with `If-Match` (via
+/// [`TeamsClient::graph_patch_etag`]); a 204 re-reads the task.
+async fn patch_task(
+    client: &TeamsClient,
+    task_id: &str,
+    etag: &str,
+    body: &serde_json::Value,
+) -> Result<PlannerTaskInfo> {
     let path = task_path(task_id)?;
     check_etag(etag)?;
-    let body = set_complete_body(complete);
-    let resp = client.graph_patch_etag(&path, etag, &body).await?;
+    let resp = client.graph_patch_etag(&path, etag, body).await?;
     let bytes = resp
         .bytes()
         .await
@@ -438,6 +501,33 @@ mod tests {
         assert_eq!(info.id, "T9");
         assert!(!info.completed);
         assert_eq!(info.etag, "W/\"etag-9\"");
+    }
+
+    #[test]
+    fn assignments_parse_and_bodies_match_graph_docs() {
+        let info = parse_task(
+            br##"{"id":"T1","title":"x","@odata.etag":"W/\"e\"",
+                 "assignments":{
+                   "u-b":{"@odata.type":"#microsoft.graph.plannerAssignment","orderHint":" !"},
+                   "u-a":{"orderHint":"8585"},
+                   "u-gone":null}}"##,
+        )
+        .unwrap();
+        assert_eq!(info.assignee_ids, vec!["u-a", "u-b"]);
+        let none = parse_task(br#"{"id":"T2"}"#).unwrap();
+        assert!(none.assignee_ids.is_empty());
+        assert_eq!(
+            set_assignment_body("u1", true).unwrap(),
+            serde_json::json!({ "assignments": { "u1": {
+                "@odata.type": "#microsoft.graph.plannerAssignment",
+                "orderHint": " !" } } })
+        );
+        assert_eq!(
+            set_assignment_body("u1", false).unwrap(),
+            serde_json::json!({ "assignments": { "u1": null } })
+        );
+        assert!(set_assignment_body("u/1", true).is_err());
+        assert!(set_assignment_body(" ", false).is_err());
     }
 
     #[test]

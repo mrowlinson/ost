@@ -28,7 +28,8 @@ pub use me::whoami_data;
 pub use planner::{
     buckets_path, create_task_body, create_task_data, list_buckets_data, list_plans_data,
     list_tasks_data, parse_buckets, parse_plans, parse_task, parse_tasks, plans_path,
-    set_complete_body, set_task_complete_data, task_path, tasks_path,
+    set_assignment_body, set_complete_body, set_task_assignee_data, set_task_complete_data,
+    task_path, tasks_path,
 };
 pub use presence::get_presence_data;
 pub use teams::list_teams_data;
