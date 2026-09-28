@@ -40,8 +40,9 @@ pub use chat::{list_chats_data, read_messages_data, send_message_with_client};
 pub use me::whoami_data;
 pub use presence::get_presence_data;
 pub use schedule::{
-    list_schedule_data, list_shifts_data, list_timeoff_reasons_data, list_timesoffs_data,
-    ScheduleInfo, ShiftInfo, TimeOffInfo, TimeOffReason,
+    list_schedule_data, list_shifts_data, list_shifts_range_data, list_timeoff_reasons_data,
+    list_timesoffs_data, list_timesoffs_range_data, schedule_range_path, ScheduleInfo, ShiftInfo,
+    TimeOffInfo, TimeOffReason,
 };
 pub use teams::list_teams_data;
 
