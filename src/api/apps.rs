@@ -508,6 +508,111 @@ pub async fn app_catalog_data(client: &TeamsClient) -> Result<AppCatalog> {
     Ok(AppCatalog { entitlements, pinned, apps })
 }
 
+/// Graph path for a team's installed apps (read-only).
+pub fn installed_apps_path(team_id: &str) -> String {
+    format!(
+        "/teams/{}/installedApps?$expand=teamsAppDefinition",
+        url::form_urlencoded::byte_serialize(team_id.as_bytes()).collect::<String>()
+    )
+}
+
+/// Catalog app ids of `GET /teams/{id}/installedApps` items
+/// (`teamsAppDefinition.teamsAppId`, else `teamsApp.id`).
+pub fn parse_installed_app_ids(v: &Value) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for item in v["value"].as_array().into_iter().flatten() {
+        let id = item["teamsAppDefinition"]["teamsAppId"]
+            .as_str()
+            .or_else(|| item["teamsApp"]["id"].as_str());
+        if let Some(id) = id.filter(|s| !s.is_empty()) {
+            if !out.iter().any(|o| o.eq_ignore_ascii_case(id)) {
+                out.push(id.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Manifests of a team's installed apps plus `extra` ids (channel-tab
+/// apps missing from the user's entitlements), via batchedDefinitions.
+/// The installedApps read is best effort; read-only throughout.
+pub async fn team_app_definitions_data(
+    client: &TeamsClient,
+    team_id: Option<&str>,
+    extra: &[String],
+) -> Result<Vec<AppManifest>> {
+    let mut ids: Vec<String> = Vec::new();
+    for id in extra {
+        if !id.is_empty() && !ids.iter().any(|o| o.eq_ignore_ascii_case(id)) {
+            ids.push(id.clone());
+        }
+    }
+    if let Some(t) = team_id.filter(|t| !t.is_empty()) {
+        match client.graph_get(&installed_apps_path(t)).await {
+            Ok(r) => match r.json::<Value>().await {
+                Ok(v) => {
+                    for id in parse_installed_app_ids(&v) {
+                        if !ids.iter().any(|o| o.eq_ignore_ascii_case(&id)) {
+                            ids.push(id);
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!("apps: installedApps unreadable: {:#}", e),
+            },
+            Err(e) => tracing::warn!("apps: installedApps failed: {:#}", e),
+        }
+    }
+    let mt = client.middle_tier_url();
+    let mut apps = Vec::new();
+    for chunk in ids.chunks(DEFINITIONS_BATCH) {
+        let v: Value = client.mt_post(&definitions_url(&mt), &definitions_body(chunk)).await?.json().await?;
+        apps.extend(parse_definitions(&v));
+    }
+    Ok(apps)
+}
+
+/// SharePoint URLs the Teams tab placeholders are built from:
+/// `{teamSiteDomain}` (tenant root site host, or the team's),
+/// `{teamSitePath}`/`{teamSiteUrl}` (the team's site) and
+/// `{mySiteDomain}`/`{mySitePath}` (the user's OneDrive).
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct SharePointSites {
+    pub root: Option<String>,
+    pub my_site: Option<String>,
+    pub team_site: Option<String>,
+}
+
+fn web_url(v: &Value) -> Option<String> {
+    v["webUrl"].as_str().filter(|s| s.starts_with("https://")).map(str::to_string)
+}
+
+/// Graph GETs (read-only), each best effort: `/sites/root`,
+/// `/me/drive` and, for a team, `/groups/{id}/sites/root`.
+pub async fn sharepoint_sites_data(client: &TeamsClient, group_id: Option<&str>) -> Result<SharePointSites> {
+    async fn get(client: &TeamsClient, path: &str) -> Option<Value> {
+        match client.graph_get(path).await {
+            Ok(r) => r.json::<Value>().await.ok(),
+            Err(e) => {
+                tracing::warn!("apps: site lookup failed: {:#}", e);
+                None
+            }
+        }
+    }
+    let root = get(client, "/sites/root?$select=webUrl").await.as_ref().and_then(web_url);
+    let my_site = get(client, "/me/drive?$select=webUrl").await.as_ref().and_then(web_url);
+    let team_site = match group_id.filter(|g| !g.is_empty()) {
+        Some(g) => {
+            let enc: String = url::form_urlencoded::byte_serialize(g.as_bytes()).collect();
+            get(client, &format!("/groups/{}/sites/root?$select=webUrl", enc)).await.as_ref().and_then(web_url)
+        }
+        None => None,
+    };
+    if root.is_none() && my_site.is_none() && team_site.is_none() {
+        anyhow::bail!("no SharePoint site found");
+    }
+    Ok(SharePointSites { root, my_site, team_site })
+}
+
 /// Store home: shelves + listed apps (read-only).
 pub async fn app_store_data(client: &TeamsClient) -> Result<AppStore> {
     let v: Value = client.mt_get(&store_url(&client.middle_tier_url())).await?.json().await?;
@@ -733,5 +838,23 @@ mod tests {
             install_body("app-a")["teamsApp@odata.bind"],
             "https://graph.microsoft.com/v1.0/appCatalogs/teamsApps/app-a"
         );
+    }
+
+    #[test]
+    fn installed_apps_parse_ids_and_path() {
+        let v = json!({"value": [
+            {"id": "x1", "teamsAppDefinition": {"teamsAppId": "app-A", "displayName": "A"}},
+            {"id": "x2", "teamsApp": {"id": "app-b"}},
+            {"id": "x3", "teamsAppDefinition": {"teamsAppId": "APP-a"}},
+            {"id": "x4"}
+        ]});
+        assert_eq!(parse_installed_app_ids(&v), vec!["app-A".to_string(), "app-b".to_string()]);
+        assert_eq!(
+            installed_apps_path("a b"),
+            "/teams/a+b/installedApps?$expand=teamsAppDefinition"
+        );
+        assert_eq!(web_url(&json!({"webUrl": "https://contoso.sharepoint.com/"})).as_deref(),
+                   Some("https://contoso.sharepoint.com/"));
+        assert_eq!(web_url(&json!({"webUrl": "http://x"})), None);
     }
 }

@@ -497,6 +497,9 @@ pub struct TokenGrant {
     pub access_token: String,
     pub expires_in: Option<u64>,
     pub scope: Option<String>,
+    /// OIDC id token (NAA grants ask for `openid`: MSAL.js rejects a
+    /// nested-app-auth reply without one). Never printed.
+    pub id_token: Option<String>,
 }
 
 impl std::fmt::Debug for TokenGrant {
@@ -505,6 +508,7 @@ impl std::fmt::Debug for TokenGrant {
             .field("access_token", &format_args!("<{} chars>", self.access_token.len()))
             .field("expires_in", &self.expires_in)
             .field("scope", &self.scope)
+            .field("id_token", &self.id_token.as_ref().map(|t| format!("<{} chars>", t.len())))
             .finish()
     }
 }
@@ -602,11 +606,23 @@ pub fn naa_grant_form(
         ("client_id".into(), nested_client_id.into()),
         ("grant_type".into(), "refresh_token".into()),
         ("refresh_token".into(), refresh_token.into()),
-        ("scope".into(), format!("{} offline_access", normalize_scopes(scopes))),
+        ("scope".into(), naa_scope(scopes)),
         ("brk_client_id".into(), broker_client_id.into()),
         ("brk_redirect_uri".into(), HUB_REDIRECT_URI.into()),
         ("redirect_uri".into(), redirect_uri.into()),
     ]
+}
+
+/// NAA grant scope: the app's scopes plus the OIDC scopes (the reply to
+/// MSAL.js needs an id token, as the Teams hub's does), deduplicated.
+pub fn naa_scope(scopes: &str) -> String {
+    let mut out: Vec<String> = normalize_scopes(scopes).split_whitespace().map(String::from).collect();
+    for s in ["openid", "profile", "offline_access"] {
+        if !out.iter().any(|o| o.eq_ignore_ascii_case(s)) {
+            out.push(s.to_string());
+        }
+    }
+    out.join(" ")
 }
 
 /// POSTs one token grant. Errors carry the AAD error code and the first
@@ -643,6 +659,7 @@ pub async fn post_token_grant(
         access_token,
         expires_in: v.get("expires_in").and_then(|e| e.as_u64().or_else(|| e.as_str()?.parse().ok())),
         scope: v.get("scope").and_then(|s| s.as_str()).map(String::from),
+        id_token: v.get("id_token").and_then(|t| t.as_str()).filter(|t| !t.is_empty()).map(String::from),
     })
 }
 
@@ -754,6 +771,7 @@ mod broker_tests {
     fn grant_forms() {
         let f = scope_grant_form("hub", "RT", "https://x.sharepoint.com");
         assert!(f.contains(&("scope".into(), "https://x.sharepoint.com/.default offline_access".into())));
+        assert_eq!(naa_scope("api://a/x openid"), "api://a/x openid profile offline_access");
         assert!(f.contains(&("client_id".into(), "hub".into())));
         assert_eq!(naa_redirect_uri("https://tasks.example.com/teamsui/x").as_deref(), Some("brk-multihub://tasks.example.com"));
         assert_eq!(naa_redirect_uri("http://localhost:8080").as_deref(), Some("brk-multihub://localhost:8080"));
@@ -763,7 +781,7 @@ mod broker_tests {
         assert!(n.contains(&("brk_client_id".into(), "hub".into())));
         assert!(n.contains(&("redirect_uri".into(), "brk-multihub://a.example.com".into())));
         assert!(n.contains(&("brk_redirect_uri".into(), HUB_REDIRECT_URI.into())));
-        let dbg = format!("{:?}", TokenGrant { access_token: "SECRET".into(), expires_in: Some(1), scope: None });
+        let dbg = format!("{:?}", TokenGrant { access_token: "SECRET".into(), expires_in: Some(1), scope: None, id_token: Some("IDSECRET".into()) });
         assert!(!dbg.contains("SECRET"));
     }
 
@@ -845,7 +863,7 @@ mod broker_tests {
 
     #[test]
     fn grant_cache_expiry_and_clear() {
-        let g = TokenGrant { access_token: "t".into(), expires_in: Some(3600), scope: None };
+        let g = TokenGrant { access_token: "t".into(), expires_in: Some(3600), scope: None, id_token: None };
         store_grant("c|s1".into(), &g);
         store_grant("c|s2".into(), &TokenGrant { expires_in: Some(60), ..g.clone() });
         assert!(cached_grant("c|s1").is_some());

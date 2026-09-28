@@ -13,8 +13,9 @@ use anyhow::Result;
 
 // Re-export data types for TUI integration
 pub use apps::{
-    app_catalog_data, app_search_data, app_store_data, install_app_for_user, AppCatalog, AppEntitlement, AppManifest,
-    AppStore, ConfigurableTab, StaticTab, StoreSection, WebApplicationInfo,
+    app_catalog_data, app_search_data, app_store_data, install_app_for_user, sharepoint_sites_data,
+    team_app_definitions_data, AppCatalog, AppEntitlement, AppManifest, AppStore, ConfigurableTab, SharePointSites,
+    StaticTab, StoreSection, WebApplicationInfo,
 };
 pub use chat::{ChatInfo, MessageInfo};
 pub use me::UserInfo;
