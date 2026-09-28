@@ -57,6 +57,32 @@ pub struct AppManifest {
     pub configurable_tabs: Vec<ConfigurableTab>,
     pub web_application_info: Option<WebApplicationInfo>,
     pub valid_domains: Vec<String>,
+    /// Long description (store detail page).
+    pub full_description: Option<String>,
+    /// Manifest `bots` / `composeExtensions` present (detail capabilities).
+    pub has_bot: bool,
+    pub has_messaging_extension: bool,
+    /// Manifest `permissions` plus resource-specific consent names.
+    pub permissions: Vec<String>,
+    /// Store categories (`categories` / `category`).
+    pub categories: Vec<String>,
+    pub website_url: Option<String>,
+    pub privacy_url: Option<String>,
+    pub terms_of_use_url: Option<String>,
+}
+
+/// One store section (a titled shelf of app ids).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StoreSection {
+    pub title: String,
+    pub app_ids: Vec<String>,
+}
+
+/// Store / app library browse data.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct AppStore {
+    pub sections: Vec<StoreSection>,
+    pub apps: Vec<AppManifest>,
 }
 
 /// One installed app for the user.
@@ -104,6 +130,27 @@ pub fn pinned_body() -> Value {
 /// batchedDefinitions body (INFERRED shape): the app ids to resolve.
 pub fn definitions_body(ids: &[String]) -> Value {
     json!({ "appIds": ids })
+}
+
+/// Store home (INFERRED shape: shelves of apps, lenient parser).
+pub fn store_url(mt: &str) -> String {
+    format!("{}/beta/users/apps/store", mt.trim_end_matches('/'))
+}
+
+/// Store search (INFERRED query parameter name).
+pub fn search_url(mt: &str, query: &str) -> String {
+    let q: String = url::form_urlencoded::byte_serialize(query.trim().as_bytes()).collect();
+    format!("{}/beta/users/apps/search?query={}", mt.trim_end_matches('/'), q)
+}
+
+/// Graph personal-scope install (documented: `POST /me/teamwork/installedApps`).
+pub const INSTALL_PATH: &str = "/me/teamwork/installedApps";
+
+/// Graph install body for a catalog app id.
+pub fn install_body(app_id: &str) -> Value {
+    json!({
+        "teamsApp@odata.bind": format!("https://graph.microsoft.com/v1.0/appCatalogs/teamsApps/{}", app_id.trim())
+    })
 }
 
 /// Definitions per batchedDefinitions call.
@@ -216,6 +263,10 @@ fn configurable_tab(t: &Value) -> Option<ConfigurableTab> {
     })
 }
 
+fn developer_url(o: &Value, key: &str) -> Option<String> {
+    o.get("developer").and_then(|d| str_field(d, &[key])).or_else(|| str_field(o, &[key]))
+}
+
 fn manifest(o: &Value) -> Option<AppManifest> {
     let id = str_field(o, &["id", "appId"])?;
     let list = |key: &str| o.get(key).and_then(Value::as_array).cloned().unwrap_or_default();
@@ -254,6 +305,35 @@ fn manifest(o: &Value) -> Option<AppManifest> {
             .collect(),
         web_application_info: wai,
         valid_domains: str_list(o, "validDomains"),
+        full_description: match o.get("description") {
+            Some(d @ Value::Object(_)) => str_field(d, &["full"]),
+            _ => str_field(o, &["longDescription", "fullDescription"]),
+        },
+        has_bot: o.get("bots").and_then(Value::as_array).is_some_and(|a| !a.is_empty()),
+        has_messaging_extension: ["composeExtensions", "inputExtensions"]
+            .iter()
+            .any(|k| o.get(*k).and_then(Value::as_array).is_some_and(|a| !a.is_empty())),
+        permissions: {
+            let mut p = str_list(o, "permissions");
+            let rsc = o
+                .pointer("/authorization/permissions/resourceSpecific")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            p.extend(rsc.iter().filter_map(|r| str_field(r, &["name"])));
+            p.dedup();
+            p
+        },
+        categories: {
+            let mut c = str_list(o, "categories");
+            if let Some(one) = str_field(o, &["category"]) {
+                c.push(one);
+            }
+            c
+        },
+        website_url: developer_url(o, "websiteUrl"),
+        privacy_url: developer_url(o, "privacyUrl"),
+        terms_of_use_url: developer_url(o, "termsOfUseUrl"),
         id,
     })
 }
@@ -285,6 +365,72 @@ pub fn parse_definitions(v: &Value) -> Vec<AppManifest> {
         }
     }
     out
+}
+
+/// Store apps: any object with an id and a name plus a listing marker
+/// (description, icons, categories or a manifest marker). Store
+/// listings carry less than a definition; missing fields stay empty.
+pub fn parse_store_apps(v: &Value) -> Vec<AppManifest> {
+    const MARKERS: [&str; 12] = [
+        "shortDescription",
+        "description",
+        "icons",
+        "largeImageUrl",
+        "categories",
+        "category",
+        "staticTabs",
+        "configurableTabs",
+        "bots",
+        "composeExtensions",
+        "manifestVersion",
+        "validDomains",
+    ];
+    let mut found = Vec::new();
+    collect(
+        v,
+        &|o| {
+            str_field(o, &["id", "appId"]).is_some()
+                && name_of(o).is_some()
+                && MARKERS.iter().any(|k| o.get(*k).is_some())
+        },
+        &mut found,
+    );
+    let mut out: Vec<AppManifest> = Vec::new();
+    for m in found.into_iter().filter_map(manifest) {
+        if !out.iter().any(|x| x.id.eq_ignore_ascii_case(&m.id)) {
+            out.push(m);
+        }
+    }
+    out
+}
+
+/// Store shelves: objects with a title and an array of apps (objects
+/// with an id, or bare id strings) under `apps`/`items`/`appIds`.
+pub fn parse_store_sections(v: &Value) -> Vec<StoreSection> {
+    let mut found = Vec::new();
+    collect(
+        v,
+        &|o| {
+            str_field(o, &["title", "displayName", "name"]).is_some()
+                && ["apps", "items", "appIds"].iter().any(|k| o.get(*k).and_then(Value::as_array).is_some())
+        },
+        &mut found,
+    );
+    found
+        .into_iter()
+        .filter_map(|o| {
+            let title = str_field(o, &["title", "displayName", "name"])?;
+            let list = ["apps", "items", "appIds"].iter().find_map(|k| o.get(*k).and_then(Value::as_array))?;
+            let app_ids: Vec<String> = list
+                .iter()
+                .filter_map(|x| match x {
+                    Value::String(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
+                    _ => str_field(x, &["id", "appId"]),
+                })
+                .collect();
+            (!app_ids.is_empty()).then_some(StoreSection { title, app_ids })
+        })
+        .collect()
 }
 
 // MARK: - Network
@@ -327,6 +473,31 @@ pub async fn app_catalog_data(client: &TeamsClient) -> Result<AppCatalog> {
         apps.extend(parse_definitions(&v));
     }
     Ok(AppCatalog { entitlements, pinned, apps })
+}
+
+/// Store home: shelves + listed apps (read-only).
+pub async fn app_store_data(client: &TeamsClient) -> Result<AppStore> {
+    let v: Value = client.mt_get(&store_url(&client.middle_tier_url())).await?.json().await?;
+    Ok(AppStore { sections: parse_store_sections(&v), apps: parse_store_apps(&v) })
+}
+
+/// Store search (read-only).
+pub async fn app_search_data(client: &TeamsClient, query: &str) -> Result<Vec<AppManifest>> {
+    if query.trim().is_empty() {
+        anyhow::bail!("empty query");
+    }
+    let v: Value = client.mt_get(&search_url(&client.middle_tier_url(), query)).await?.json().await?;
+    Ok(parse_store_apps(&v))
+}
+
+/// Installs a catalog app for the signed-in user (REMOTE WRITE: the
+/// tenant sees a new personal install). Callers must confirm first.
+pub async fn install_app_for_user(client: &TeamsClient, app_id: &str) -> Result<()> {
+    if app_id.trim().is_empty() {
+        anyhow::bail!("empty app id");
+    }
+    client.graph_post(INSTALL_PATH, &install_body(app_id)).await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -434,5 +605,55 @@ mod tests {
         assert!(definitions_url(mt).contains("/beta/users/apps/batchedDefinitions?"));
         assert_eq!(definitions_body(&["x".into()]), json!({"appIds": ["x"]}));
         assert!(pinned_body().is_array());
+    }
+
+    #[test]
+    fn store_parse_sections_detail_fields_and_install_body() {
+        let v = json!({
+            "sections": [
+                { "title": "Popular", "apps": [{ "id": "app-a" }, "app-b"] },
+                { "title": "Empty", "items": [] }
+            ],
+            "apps": [
+                {
+                    "id": "app-a",
+                    "name": { "short": "Board", "full": "Sprint Board" },
+                    "description": { "short": "Plan sprints", "full": "Plan sprints with your team." },
+                    "developer": { "name": "Northwind Labs", "websiteUrl": "https://northwind.example",
+                                   "privacyUrl": "https://northwind.example/privacy" },
+                    "categories": ["Productivity"],
+                    "bots": [{ "botId": "b" }],
+                    "composeExtensions": [],
+                    "permissions": ["identity"],
+                    "authorization": { "permissions": { "resourceSpecific": [{ "name": "ChannelMessage.Read.Group" }] } },
+                    "validDomains": ["northwind.example"]
+                },
+                { "appId": "app-b", "displayName": "Polls", "shortDescription": "Quick polls", "category": "Utilities" }
+            ]
+        });
+        let sections = parse_store_sections(&v);
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].title, "Popular");
+        assert_eq!(sections[0].app_ids, vec!["app-a", "app-b"]);
+        let apps = parse_store_apps(&v);
+        assert_eq!(apps.len(), 2);
+        let a = &apps[0];
+        assert_eq!(a.name, "Board");
+        assert_eq!(a.full_description.as_deref(), Some("Plan sprints with your team."));
+        assert!(a.has_bot);
+        assert!(!a.has_messaging_extension);
+        assert_eq!(a.permissions, vec!["identity", "ChannelMessage.Read.Group"]);
+        assert_eq!(a.categories, vec!["Productivity"]);
+        assert_eq!(a.privacy_url.as_deref(), Some("https://northwind.example/privacy"));
+        assert_eq!(apps[1].categories, vec!["Utilities"]);
+        assert_eq!(apps[1].short_description.as_deref(), Some("Quick polls"));
+        assert_eq!(
+            search_url("https://mt.example/api/mt/amer/", "sprint board"),
+            "https://mt.example/api/mt/amer/beta/users/apps/search?query=sprint+board"
+        );
+        assert_eq!(
+            install_body("app-a")["teamsApp@odata.bind"],
+            "https://graph.microsoft.com/v1.0/appCatalogs/teamsApps/app-a"
+        );
     }
 }

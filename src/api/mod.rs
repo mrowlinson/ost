@@ -12,7 +12,10 @@ mod teams;
 use anyhow::Result;
 
 // Re-export data types for TUI integration
-pub use apps::{app_catalog_data, AppCatalog, AppEntitlement, AppManifest, ConfigurableTab, StaticTab, WebApplicationInfo};
+pub use apps::{
+    app_catalog_data, app_search_data, app_store_data, install_app_for_user, AppCatalog, AppEntitlement, AppManifest,
+    AppStore, ConfigurableTab, StaticTab, StoreSection, WebApplicationInfo,
+};
 pub use chat::{ChatInfo, MessageInfo};
 pub use me::UserInfo;
 pub use presence::PresenceInfo;
