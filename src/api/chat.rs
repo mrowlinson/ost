@@ -3,7 +3,7 @@
 //! Uses the Skype token with `Authentication: skypetoken={token}` header,
 //! bypassing Graph API which requires tenant admin consent for Chat.Read.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
 use super::client::TeamsClient;
@@ -292,6 +292,62 @@ pub async fn send_message_with_client(
 }
 
 // ---------------------------------------------------------------------------
+// Channel thread replies
+// ---------------------------------------------------------------------------
+//
+// Teams channels are reply chains: a reply is a message posted to the
+// thread conversation `<channelId>;messageid=<rootId>` (the same link
+// shape the server stamps on channel replies' `conversationLink`), not
+// a new top-level post carrying a quote block. Chats (1:1, group,
+// meeting) have no chains — they keep the quote-reply path.
+
+/// True for channel conversation ids (`19:…@thread.tacv2`, legacy
+/// `19:…@thread.skype`). Group chats (`@thread.v2`), meetings and
+/// 1:1s are not channels. Pure so tests pin it.
+pub fn is_channel_conversation_id(id: &str) -> bool {
+    let t = id.trim();
+    t.starts_with("19:") && (t.ends_with("@thread.tacv2") || t.ends_with("@thread.skype"))
+}
+
+/// Thread conversation id for a channel reply chain. Pure.
+pub fn thread_reply_conversation(channel_id: &str, root_id: &str) -> String {
+    format!("{};messageid={}", channel_id.trim(), root_id.trim())
+}
+
+/// POST URL for one channel thread reply. Pure so tests pin it.
+pub fn thread_reply_url(base: &str, channel_id: &str, root_id: &str) -> String {
+    format!(
+        "{}/v1/users/ME/conversations/{}/messages",
+        base,
+        thread_reply_conversation(channel_id, root_id)
+    )
+}
+
+/// Post one reply into a channel thread (reply chain under `root_id`).
+/// Body is the plain send body (no quote block — the chain is the
+/// link). Non-channel ids and blank args are rejected before network.
+pub async fn thread_reply_with_client(
+    client: &TeamsClient,
+    channel_id: &str,
+    root_id: &str,
+    text: &str,
+) -> Result<()> {
+    if !is_channel_conversation_id(channel_id) {
+        bail!("not a channel conversation id");
+    }
+    if root_id.trim().is_empty() || root_id.contains(';') || root_id.contains('/') {
+        bail!("bad root message id");
+    }
+    if text.trim().is_empty() {
+        bail!("empty text");
+    }
+    let url = thread_reply_url(&client.chat_service_url(), channel_id, root_id);
+    tracing::debug!("Sending thread reply");
+    client.chat_post(&url, &send_message_body(text)).await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Data-returning API functions for TUI integration
 // ---------------------------------------------------------------------------
 
@@ -532,5 +588,26 @@ mod tests {
         assert_eq!(html.matches("<pre>").count(), WIRE_FENCE_MAX_BLOCKS);
         // 51st block never parsed: its fences stay literal prose, nothing lost.
         assert!(html.contains("```\nc50\n```"), "{}", html);
+    }
+
+    #[test]
+    fn channel_thread_reply_shape() {
+        assert!(is_channel_conversation_id("19:abc@thread.tacv2"));
+        assert!(is_channel_conversation_id(" 19:abc@thread.skype "));
+        assert!(!is_channel_conversation_id("19:abc@thread.v2"));
+        assert!(!is_channel_conversation_id("19:meeting_x@thread.v2"));
+        assert!(!is_channel_conversation_id("19:a_b@unq.gbl.spaces"));
+        assert!(!is_channel_conversation_id("48:notes"));
+        assert_eq!(
+            thread_reply_conversation(" 19:c@thread.tacv2 ", " 17 "),
+            "19:c@thread.tacv2;messageid=17"
+        );
+        assert_eq!(
+            thread_reply_url("https://h", "19:c@thread.tacv2", " 1700000000000 "),
+            "https://h/v1/users/ME/conversations/19:c@thread.tacv2;messageid=1700000000000/messages"
+        );
+        // Plain send body: no quote block rides a chain reply.
+        let b = send_message_body("yo");
+        assert!(!b["content"].as_str().unwrap().contains("<quote"));
     }
 }
