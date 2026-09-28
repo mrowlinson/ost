@@ -11,7 +11,7 @@ mod teams;
 use anyhow::Result;
 
 // Re-export data types for TUI integration
-pub use chat::{ChatInfo, MessageInfo, MessagesPage};
+pub use chat::{ChatInfo, ChatMemberInfo, MessageInfo, MessagesPage, RosterSource};
 pub use me::UserInfo;
 pub use presence::PresenceInfo;
 pub use teams::TeamInfo;
@@ -23,7 +23,8 @@ pub use teams::ChannelInfo;
 
 // Re-export data-returning functions for TUI integration
 pub use chat::{
-    list_chats_data, read_messages_data, read_messages_page, send_message_with_client,
+    chat_members_path, list_chat_members_data, list_chats_data, parse_graph_chat_members,
+    parse_thread_members, read_messages_data, read_messages_page, send_message_with_client,
 };
 pub use media::{fetch_media_data, MediaBytes, MAX_BYTES};
 pub use me::whoami_data;

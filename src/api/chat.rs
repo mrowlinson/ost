@@ -3,7 +3,7 @@
 //! Uses the Skype token with `Authentication: skypetoken={token}` header,
 //! bypassing Graph API which requires tenant admin consent for Chat.Read.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
 use super::client::TeamsClient;
@@ -317,6 +317,11 @@ pub struct MessagesPage {
 #[derive(Debug, Deserialize)]
 struct ThreadMember {
     id: Option<String>,
+    /// `Admin` / `User` (roster roles; absent on some shapes).
+    role: Option<String>,
+    /// Some tenants stamp a display name; usually absent.
+    #[serde(rename = "friendlyName")]
+    friendly_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -434,6 +439,162 @@ async fn resolve_mate_name(
         .map(|m| m.sender.clone())
         .filter(|s| !s.trim().is_empty() && s != "?")
         .next()
+}
+
+/// Case-insensitive object field lookup.
+fn obj_get_ci<'a>(
+    o: &'a serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Option<&'a serde_json::Value> {
+    o.get(key)
+        .or_else(|| o.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)).map(|(_, v)| v))
+}
+
+fn obj_str_ci(o: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<String> {
+    obj_get_ci(o, key)
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+// ---------------------------------------------------------------------------
+// Chat roster
+// ---------------------------------------------------------------------------
+
+/// One chat member. `mri` is the chat-service identity
+/// (`8:orgid:<guid>`); `user_id` the Graph/AAD id (presence key).
+/// `is_owner` is id-based: Graph `roles` contains `owner`, or the
+/// chat-service role is `Admin`. `display_name` may be "" (chat
+/// service rosters carry no names — the embedder resolves them).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatMemberInfo {
+    pub mri: String,
+    pub user_id: Option<String>,
+    pub display_name: String,
+    pub email: Option<String>,
+    pub roles: Vec<String>,
+    pub is_owner: bool,
+}
+
+/// Graph `GET /chats/{id}/members` path. Pure so tests pin it.
+pub fn chat_members_path(chat_id: &str) -> String {
+    format!("/chats/{}/members", chat_id.trim())
+}
+
+/// AAD object id from an orgid MRI (`8:orgid:<guid>` → `<guid>`).
+fn oid_from_orgid_mri(mri: &str) -> Option<String> {
+    let t = mri.trim();
+    let rest = t.get(..8).filter(|p| p.eq_ignore_ascii_case("8:orgid:")).map(|_| &t[8..])?;
+    let rest = rest.trim();
+    if rest.is_empty() {
+        None
+    } else {
+        Some(rest.to_string())
+    }
+}
+
+/// Parse a Graph `conversationMember` collection (`{value:[…]}`).
+/// Entries without a `userId` are skipped (bots/guests we cannot key).
+/// Pure so tests pin it.
+pub fn parse_graph_chat_members(value: &serde_json::Value) -> Result<Vec<ChatMemberInfo>> {
+    let list = value
+        .get("value")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| anyhow::anyhow!("chat members response has no value[]"))?;
+    let mut out = Vec::new();
+    for e in list {
+        let Some(o) = e.as_object() else { continue };
+        let Some(user_id) = obj_str_ci(o, "userId") else { continue };
+        let roles: Vec<String> = obj_get_ci(o, "roles")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|r| r.as_str())
+                    .map(|r| r.trim().to_lowercase())
+                    .filter(|r| !r.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let is_owner = roles.iter().any(|r| r == "owner");
+        out.push(ChatMemberInfo {
+            mri: format!("8:orgid:{}", user_id),
+            user_id: Some(user_id),
+            display_name: obj_str_ci(o, "displayName").unwrap_or_default(),
+            email: obj_str_ci(o, "email"),
+            roles,
+            is_owner,
+        });
+    }
+    Ok(out)
+}
+
+/// Parse a chat-service `GET /v1/threads/{id}/members` body. Roles
+/// lowercase (`admin`/`user`); `admin` is the owner. Blank ids skip.
+/// Pure so tests pin it.
+pub fn parse_thread_members(value: &serde_json::Value) -> Result<Vec<ChatMemberInfo>> {
+    let body: ThreadMembersResponse = serde_json::from_value(value.clone())
+        .context("Failed to parse thread members response")?;
+    Ok(body
+        .members
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|m| {
+            let mri = m.id.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())?;
+            let roles: Vec<String> = m
+                .role
+                .map(|r| r.trim().to_lowercase())
+                .filter(|r| !r.is_empty())
+                .into_iter()
+                .collect();
+            let is_owner = roles.iter().any(|r| r == "admin");
+            Some(ChatMemberInfo {
+                user_id: oid_from_orgid_mri(&mri),
+                mri,
+                display_name: m.friendly_name.map(|s| s.trim().to_string()).unwrap_or_default(),
+                email: None,
+                roles,
+                is_owner,
+            })
+        })
+        .collect())
+}
+
+/// Where a roster came from (names are only on the Graph path).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RosterSource {
+    Graph,
+    ChatService,
+}
+
+/// Roster for one chat: Graph `GET /chats/{id}/members` (names, emails,
+/// owner roles) first; on any Graph failure, the chat-service thread
+/// roster (MRIs + Admin/User roles, skypetoken auth). Both failing
+/// returns the chat-service error.
+pub async fn list_chat_members_data(
+    client: &TeamsClient,
+    chat_id: &str,
+) -> Result<(RosterSource, Vec<ChatMemberInfo>)> {
+    if chat_id.trim().is_empty() {
+        bail!("empty chat_id");
+    }
+    let graph = async {
+        let resp = client.graph_get(&chat_members_path(chat_id)).await?;
+        let v: serde_json::Value = resp.json().await.context("chat members json")?;
+        parse_graph_chat_members(&v)
+    }
+    .await;
+    match graph {
+        Ok(m) if !m.is_empty() => return Ok((RosterSource::Graph, m)),
+        Ok(_) => tracing::debug!("graph chat roster empty, trying chat service"),
+        Err(e) => tracing::debug!("graph chat roster failed: {:#}", e),
+    }
+    let url = format!("{}/v1/threads/{}/members", client.chat_service_url(), chat_id.trim());
+    let resp = client.chat_get(&url).await?;
+    let v: serde_json::Value = resp
+        .json()
+        .await
+        .context("Failed to parse thread members response")?;
+    Ok((RosterSource::ChatService, parse_thread_members(&v)?))
 }
 
 /// List recent chats and return structured data.
@@ -836,5 +997,47 @@ src="x">"#));
             .filter_map(|m| m.id)
             .collect();
         assert_eq!(ids, vec!["8:orgid:self", "8:orgid:mate"]);
+    }
+
+    #[test]
+    fn chat_roster_parse_graph_and_chat_service() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"value":[
+              {"id":"m1","roles":["Owner"],"displayName":"Ava","userId":"aad-1","email":"ava@x.com"},
+              {"id":"m2","roles":[],"displayName":"Tom","userId":"aad-2"},
+              {"id":"m3","roles":["guest"],"displayName":"Bot"}
+            ]}"#,
+        )
+        .unwrap();
+        let m = parse_graph_chat_members(&v).unwrap();
+        assert_eq!(m.len(), 2);
+        assert_eq!(m[0].mri, "8:orgid:aad-1");
+        assert_eq!(m[0].user_id.as_deref(), Some("aad-1"));
+        assert!(m[0].is_owner);
+        assert_eq!(m[0].roles, vec!["owner".to_string()]);
+        assert_eq!(m[0].email.as_deref(), Some("ava@x.com"));
+        assert!(!m[1].is_owner);
+        assert_eq!(m[1].display_name, "Tom");
+        assert!(parse_graph_chat_members(&serde_json::json!({"nope": 1})).is_err());
+
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"members":[
+              {"id":"8:orgid:aad-1","role":"Admin"},
+              {"id":"8:orgid:aad-2","role":"User","friendlyName":"Tom"},
+              {"id":"28:bot-1"},
+              {"id":"  "}
+            ]}"#,
+        )
+        .unwrap();
+        let m = parse_thread_members(&v).unwrap();
+        assert_eq!(m.len(), 3);
+        assert!(m[0].is_owner);
+        assert_eq!(m[0].roles, vec!["admin".to_string()]);
+        assert_eq!(m[0].user_id.as_deref(), Some("aad-1"));
+        assert!(!m[1].is_owner);
+        assert_eq!(m[1].display_name, "Tom");
+        assert_eq!(m[2].user_id, None);
+        assert!(m[2].roles.is_empty());
+        assert_eq!(chat_members_path(" 19:g@thread.v2 "), "/chats/19:g@thread.v2/members");
     }
 }
