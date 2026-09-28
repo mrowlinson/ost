@@ -11,7 +11,10 @@ mod teams;
 use anyhow::Result;
 
 // Re-export data types for TUI integration
-pub use chat::{ChatInfo, MessageInfo, MessagesPage, ReactionCount, REACTION_EMOJI};
+pub use chat::{
+    reaction_counts_from_values, ChatInfo, MessageInfo, MessagesPage, ReactionCount, Reactor,
+    REACTION_EMOJI,
+};
 pub use me::UserInfo;
 pub use presence::PresenceInfo;
 pub use teams::TeamInfo;

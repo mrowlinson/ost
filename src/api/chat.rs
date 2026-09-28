@@ -47,22 +47,18 @@ struct NativeMessage {
     from: Option<String>,
     /// OstMac om-reactions: per-message reactions when the server sends
     /// them (Graph-like list). Absent on old payloads → no counts.
-    reactions: Option<Vec<NativeReaction>>,
+    /// Kept raw so reactor ids/names survive unknown shapes.
+    reactions: Option<serde_json::Value>,
     /// Alternate nesting some payloads use (`properties.reactions`).
     properties: Option<MessageProperties>,
 }
 
 #[derive(Debug, Deserialize)]
 struct MessageProperties {
-    reactions: Option<Vec<NativeReaction>>,
-}
-
-/// One raw reaction entry. Only the type is aggregated; user/count
-/// variants ride along unparsed so unknown shapes still deserialize.
-#[derive(Debug, Deserialize)]
-struct NativeReaction {
-    #[serde(rename = "reactionType")]
-    reaction_type: Option<String>,
+    reactions: Option<serde_json::Value>,
+    /// Native chat-service reactions: `[{key, users:[{mri}]}]`, often
+    /// stringified.
+    emotions: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -415,50 +411,137 @@ pub struct MessageInfo {
 }
 
 /// One grouped reaction count: picker emoji + number of reactors.
+/// `reactors` lists who reacted when the wire names them;
+/// it may be shorter than `count` (entries without an id still count).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReactionCount {
     pub emoji: String,
     pub count: usize,
+    pub reactors: Vec<Reactor>,
 }
 
-/// Group raw reaction entries into per-emoji counts in canonical picker
-/// order. Entries with missing/unknown types are skipped.
-fn aggregate_reactions(entries: &[NativeReaction]) -> Vec<ReactionCount> {
+/// One reactor (who reacted). `id` is whatever the wire names
+/// the user by: an MRI (`8:orgid:<guid>`, native `emotions`) or a
+/// Graph user id (Graph-like `reactions[].user.user.id`). `name` is
+/// the display name when the wire carries one, else "" (the embedder
+/// resolves MRIs through the chat roster).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reactor {
+    pub id: String,
+    pub name: String,
+}
+
+/// Picker index for a wire reaction type (case-insensitive).
+fn reaction_index(t: &str) -> Option<usize> {
+    REACTION_EMOJI
+        .iter()
+        .position(|(_, known)| known.eq_ignore_ascii_case(t.trim()))
+}
+
+/// Case-insensitive object field lookup.
+fn obj_get_ci<'a>(
+    o: &'a serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Option<&'a serde_json::Value> {
+    o.get(key)
+        .or_else(|| o.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)).map(|(_, v)| v))
+}
+
+fn obj_str_ci(o: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<String> {
+    obj_get_ci(o, key)
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Reactor from one Graph-like entry: `user.user.{id,displayName}`
+/// (chatMessageReaction) or a flat `user.{id,displayName}`.
+fn graph_reactor(entry: &serde_json::Map<String, serde_json::Value>) -> Option<Reactor> {
+    let user = obj_get_ci(entry, "user")?.as_object()?;
+    let identity = obj_get_ci(user, "user")
+        .and_then(|v| v.as_object())
+        .unwrap_or(user);
+    let id = obj_str_ci(identity, "id")?;
+    let name = obj_str_ci(identity, "displayName").unwrap_or_default();
+    Some(Reactor { id, name })
+}
+
+/// JSON arrays may arrive stringified inside `properties` (native
+/// chat service habit); decode once, anything else passes through.
+fn as_array_lenient(v: &serde_json::Value) -> Option<Vec<serde_json::Value>> {
+    match v {
+        serde_json::Value::Array(a) => Some(a.clone()),
+        serde_json::Value::String(s) => serde_json::from_str::<Vec<serde_json::Value>>(s).ok(),
+        _ => None,
+    }
+}
+
+/// Grouped reactions from raw wire values (public so realtime/event
+/// parsers can reuse it). `reactions` is the Graph-like list
+/// (`[{reactionType, user?}]`, one entry per reactor); `emotions` is
+/// the native chat-service form (`[{key, users:[{mri}]}]`, array or
+/// stringified). The Graph-like list wins when present. Canonical
+/// picker order; unknown types drop; never fatal.
+pub fn reaction_counts_from_values(
+    reactions: Option<&serde_json::Value>,
+    emotions: Option<&serde_json::Value>,
+) -> Vec<ReactionCount> {
     let mut counts = vec![0usize; REACTION_EMOJI.len()];
-    for e in entries {
-        let Some(t) = e.reaction_type.as_deref() else {
-            continue;
-        };
-        if let Some(i) = REACTION_EMOJI
-            .iter()
-            .position(|(_, known)| known.eq_ignore_ascii_case(t))
-        {
-            counts[i] += 1;
+    let mut reactors: Vec<Vec<Reactor>> = vec![Vec::new(); REACTION_EMOJI.len()];
+    let mut push = |i: usize, r: Option<Reactor>| {
+        counts[i] += 1;
+        if let Some(r) = r {
+            if !reactors[i].iter().any(|x| x.id.eq_ignore_ascii_case(&r.id)) {
+                reactors[i].push(r);
+            }
+        }
+    };
+    if let Some(list) = reactions.and_then(as_array_lenient) {
+        for e in &list {
+            let Some(o) = e.as_object() else { continue };
+            let Some(t) = obj_str_ci(o, "reactionType") else { continue };
+            if let Some(i) = reaction_index(&t) {
+                push(i, graph_reactor(o));
+            }
+        }
+    } else if let Some(list) = emotions.and_then(as_array_lenient) {
+        for e in &list {
+            let Some(o) = e.as_object() else { continue };
+            let Some(t) = obj_str_ci(o, "key") else { continue };
+            let Some(i) = reaction_index(&t) else { continue };
+            let users = obj_get_ci(o, "users").and_then(as_array_lenient).unwrap_or_default();
+            for u in &users {
+                let Some(uo) = u.as_object() else { continue };
+                let id = obj_str_ci(uo, "mri").or_else(|| obj_str_ci(uo, "id"));
+                let name = obj_str_ci(uo, "displayName").unwrap_or_default();
+                push(i, id.map(|id| Reactor { id, name }));
+            }
         }
     }
     REACTION_EMOJI
         .iter()
-        .zip(counts)
-        .filter(|(_, c)| *c > 0)
-        .map(|((emoji, _), count)| ReactionCount {
+        .zip(counts.into_iter().zip(reactors))
+        .filter(|(_, (c, _))| *c > 0)
+        .map(|((emoji, _), (count, reactors))| ReactionCount {
             emoji: emoji.to_string(),
             count,
+            reactors,
         })
         .collect()
 }
 
 /// Reaction entries for one message: top-level `reactions` wins, then
-/// `properties.reactions`. Neither present → empty.
+/// `properties.reactions`, then native `properties.emotions`. None
+/// present → empty.
 fn message_reactions(msg: &NativeMessage) -> Vec<ReactionCount> {
-    if let Some(list) = msg.reactions.as_deref() {
-        return aggregate_reactions(list);
-    }
-    if let Some(props) = msg.properties.as_ref() {
-        if let Some(list) = props.reactions.as_deref() {
-            return aggregate_reactions(list);
-        }
-    }
-    Vec::new()
+    let props = msg.properties.as_ref();
+    let graph = msg
+        .reactions
+        .as_ref()
+        .filter(|v| !v.is_null())
+        .or_else(|| props.and_then(|p| p.reactions.as_ref()).filter(|v| !v.is_null()));
+    let emotions = props.and_then(|p| p.emotions.as_ref()).filter(|v| !v.is_null());
+    reaction_counts_from_values(graph, emotions)
 }
 
 /// One page of history plus the cursor for the next older page.
@@ -803,11 +886,13 @@ src="x">"#));
             vec![
                 ReactionCount {
                     emoji: "👍".to_string(),
-                    count: 2
+                    count: 2,
+                    reactors: vec![]
                 },
                 ReactionCount {
                     emoji: "😂".to_string(),
-                    count: 1
+                    count: 1,
+                    reactors: vec![]
                 },
             ]
         );
@@ -825,12 +910,62 @@ src="x">"#));
             message_reactions(&msg),
             vec![ReactionCount {
                 emoji: "❤️".to_string(),
-                count: 1
+                count: 1,
+                reactors: vec![]
             }]
         );
         // No reactions key at all → empty, old payloads unaffected.
         let bare: NativeMessage =
             serde_json::from_str(r#"{"id":"1","content":"<p>hi</p>"}"#).unwrap();
         assert!(message_reactions(&bare).is_empty());
+    }
+
+    #[test]
+    fn reactors_graph_and_native_emotions() {
+        use serde_json::json;
+        // Graph-like entries: one per reactor; both user nestings.
+        let graph = json!([
+            {"reactionType":"like","user":{"user":{"id":"aad-1","displayName":"Ava"}}},
+            {"reactionType":"like","user":{"id":"aad-2","displayName":"Tom"}},
+            {"reactionType":"like"},
+            {"reactionType":"party"}
+        ]);
+        let r = reaction_counts_from_values(Some(&graph), None);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].count, 3);
+        assert_eq!(
+            r[0].reactors,
+            vec![
+                Reactor { id: "aad-1".into(), name: "Ava".into() },
+                Reactor { id: "aad-2".into(), name: "Tom".into() },
+            ]
+        );
+        // Native chat-service emotions (stringified), MRIs only.
+        let emotions = json!(serde_json::to_string(&json!([
+            {"key":"heart","users":[{"mri":"8:orgid:a","time":1},{"mri":"8:orgid:b","time":2}]},
+            {"key":"party","users":[{"mri":"8:orgid:c"}]}
+        ]))
+        .unwrap());
+        let r = reaction_counts_from_values(None, Some(&emotions));
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].emoji, "\u{2764}\u{fe0f}");
+        assert_eq!(r[0].count, 2);
+        assert_eq!(r[0].reactors[1].id, "8:orgid:b");
+        assert_eq!(r[0].reactors[1].name, "");
+        // Graph list wins over emotions when both are present.
+        let r = reaction_counts_from_values(Some(&graph), Some(&emotions));
+        assert_eq!(r[0].emoji, "\u{1f44d}");
+        assert!(reaction_counts_from_values(None, None).is_empty());
+
+        // Native emotions nested under message properties reach the counts.
+        let msg: NativeMessage = serde_json::from_value(json!({
+            "id": "1",
+            "properties": {"emotions": [{"key":"like","users":[{"mri":"8:orgid:z"}]}]}
+        }))
+        .unwrap();
+        let r = message_reactions(&msg);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].count, 1);
+        assert_eq!(r[0].reactors[0].id, "8:orgid:z");
     }
 }
