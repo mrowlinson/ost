@@ -777,6 +777,25 @@ pub fn rename_body(new_name: &str) -> serde_json::Value {
     serde_json::json!({ "name": new_name })
 }
 
+/// Graph path of a drive's root folder (id only).
+pub fn drive_root_path(drive_id: &str) -> String {
+    format!("/drives/{}/root?$select=id", drive_id)
+}
+
+/// Graph rejects `"id": "root"` in a move/copy parentReference: the
+/// alias resolves to the root folder's real id. Other ids pass through.
+async fn resolve_folder_id(client: &TeamsClient, drive_id: &str, folder_id: &str) -> Result<String> {
+    if folder_id != "root" {
+        return Ok(folder_id.to_string());
+    }
+    let resp = client.graph_get(&drive_root_path(drive_id)).await?;
+    let root: serde_json::Value = resp.json().await.context("Failed to parse drive root")?;
+    match root.get("id").and_then(|v| v.as_str()) {
+        Some(id) if !id.is_empty() => Ok(id.to_string()),
+        _ => bail!("Drive root has no id"),
+    }
+}
+
 /// PATCH body moving an item to another folder (same drive).
 pub fn move_body(dest_folder_id: &str) -> serde_json::Value {
     serde_json::json!({ "parentReference": { "id": dest_folder_id } })
@@ -826,10 +845,9 @@ pub async fn move_file_data(
     if dest_folder_id.trim().is_empty() {
         bail!("Destination folder id is empty");
     }
+    let dest = resolve_folder_id(client, drive_id, dest_folder_id).await?;
     let path = drive_item_path(drive_id, item_id);
-    let resp = client
-        .graph_patch(&path, &move_body(dest_folder_id))
-        .await?;
+    let resp = client.graph_patch(&path, &move_body(&dest)).await?;
     let item: DriveItem = resp.json().await.context("Failed to parse move response")?;
     Ok(shared_from_item(item, None))
 }
@@ -847,9 +865,10 @@ pub async fn copy_file_data(
     if dest_folder_id.trim().is_empty() {
         bail!("Destination folder id is empty");
     }
+    let dest = resolve_folder_id(client, drive_id, dest_folder_id).await?;
     let path = format!("{}/copy", drive_item_path(drive_id, item_id));
     let resp = client
-        .graph_post(&path, &copy_body(drive_id, dest_folder_id, new_name))
+        .graph_post(&path, &copy_body(drive_id, &dest, new_name))
         .await?;
     Ok(resp
         .headers()
@@ -1080,6 +1099,7 @@ mod tests {
     fn manage_paths_and_bodies() {
         // driveItem PATCH/DELETE manage shapes.
         assert_eq!(drive_item_path("D1", "I1"), "/drives/D1/items/I1");
+        assert_eq!(drive_root_path("D1"), "/drives/D1/root?$select=id");
         assert_eq!(
             rename_body("plan v2.docx"),
             serde_json::json!({"name": "plan v2.docx"})
