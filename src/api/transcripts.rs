@@ -29,15 +29,14 @@
 //! is not used (it needs tenant admin consent); this module is
 //! drive-backed only. A 403 surfaces as the call's detail.
 //!
-//! `.docx` twin (transcripts-fix lane): the build lane live-probed
-//! own OneDrive and found zero Teams-written transcript twins (7
-//! unrelated `.docx`, none in `Recordings`, none transcript-named).
-//! The fix lane re-adds `.docx`/`.doc` NARROWLY: only when the stem
-//! contains `transcript` (case-insensitive; covers `transcription`),
+//! `.docx` twin: a live probe of a OneDrive found zero Teams-written
+//! transcript twins (7 unrelated `.docx`, none in `Recordings`, none
+//! transcript-named). This module accepts `.docx`/`.doc` NARROWLY:
+//! only when the stem contains `transcript` (case-insensitive; covers `transcription`),
 //! so those 7 unrelated files still filter out. Exact rules live on
 //! [`is_transcript`].
 //!
-//! Full-drive search fallback (transcripts-fix lane): meetings the
+//! Full-drive search fallback: meetings the
 //! user did NOT organize keep their `.vtt`/transcript-`.docx` in the
 //! organizer's OneDrive — unreachable from the signed-in drive (see
 //! HONEST GAP below). But transcript-ish files can also sit OUTSIDE
@@ -55,12 +54,12 @@
 //! user's drive, and the Graph transcript API
 //! (`GET /me/onlineMeetings/{id}/transcripts`, app permission
 //! `OnlineMeetingTranscript.Read.All`) needs tenant-admin consent,
-//! which the owner DECLINED. So: transcripts of meetings organized
+//! which is often not granted. So: transcripts of meetings organized
 //! by someone else are unreachable from this module, by design.
-//! The empty state says so (Swift side); nothing here retries or
-//! fabricates them.
+//! Callers should surface this in their empty state; nothing here
+//! retries or fabricates them.
 //!
-//! Cost of the raised caps (transcripts-fix lane): worst case per
+//! Cost of the raised caps: worst case per
 //! list call is 1 teams scan + 100 filesFolder lookups + 100 folder
 //! scans + 100 Recordings lists = ~301 requests (was ~151 at the
 //! 50/50 caps), all sequential, each small JSON. The search path is
@@ -77,19 +76,19 @@ use super::client::TeamsClient;
 pub const TRANSCRIPTS_FOLDER: &str = "Recordings";
 
 /// Per-request result cap for list + search windows.
-/// Raised 50 -> 100 by the transcripts-fix lane (channel-heavy
+/// Raised 50 -> 100 (channel-heavy
 /// tenants truncated at 50; cost is one `$top=100` window per drive).
 pub const TRANSCRIPTS_MAX_LIMIT: usize = 100;
 
 /// Upper bound on channel drives fanned out to (list + search stay
 /// one teams scan plus bounded folder/search windows).
-/// Raised 50 -> 100 by the transcripts-fix lane: tenants with more
+/// Raised 50 -> 100: tenants with more
 /// than 50 channels silently lost transcript folders. Worst-case
 /// cost per list call roughly doubles (~151 -> ~301 small
 /// sequential requests; see the module docs).
 pub const MAX_CHANNEL_DRIVES: usize = 100;
 
-/// Fallback drive-search queries (transcripts-fix lane): when the
+/// Fallback drive-search queries: when the
 /// `Recordings`-folder scan finds zero rows, the list falls back to
 /// full-drive search so transcript-ish files OUTSIDE `Recordings`
 /// still surface. `.vtt` catches bare caption files; `transcript`
@@ -252,7 +251,7 @@ pub struct TranscriptInfo {
 }
 
 /// True when a driveItem name/mime looks like a transcript.
-/// Exact rules (transcripts-fix lane):
+/// Exact rules:
 /// 1. `.vtt` extension (any case) accepts, whatever the mime
 ///    (Graph sometimes omits it or reports `text/plain`).
 /// 2. `text/vtt` mime (case-insensitive) accepts, whatever the
@@ -260,8 +259,8 @@ pub struct TranscriptInfo {
 /// 3. `.docx`/`.doc` extension (any case) accepts ONLY when the
 ///    stem (name minus extension) contains `transcript`
 ///    (case-insensitive; covers `transcription`). The Word mime
-///    alone does NOT accept: the build lane found 7 unrelated
-///    `.docx` on the drive, and this name gate keeps them out.
+///    alone does NOT accept: a live probe found 7 unrelated
+///    `.docx` on a drive, and this name gate keeps them out.
 /// Pure so list, search, fallback, and tests share it.
 pub fn is_transcript(name: &str, mime: Option<&str>) -> bool {
     if let Some(m) = mime {
@@ -505,8 +504,8 @@ pub async fn list_transcripts_data(
         bail!("no drive answered the transcripts list");
     }
 
-    // Empty folder scan -> bounded full-drive search fallback
-    // (transcripts-fix lane). OneDrive gets both fallback queries
+    // Empty folder scan -> bounded full-drive search fallback.
+    // OneDrive gets both fallback queries
     // (`.vtt` catches bare caption files anywhere; `transcript`
     // catches transcript twins by name); each channel drive gets the
     // `transcript` query only (channel `.vtt` stragglers outside
@@ -635,8 +634,8 @@ mod tests {
     }
 
     #[test]
-    fn caps_are_raised_fix_lane_values() {
-        // transcripts-fix lane: 50 -> 100 on both caps.
+    fn caps_are_raised_to_100() {
+        // 50 -> 100 on both caps.
         assert_eq!(TRANSCRIPTS_MAX_LIMIT, 100);
         assert_eq!(MAX_CHANNEL_DRIVES, 100);
     }
@@ -708,7 +707,7 @@ mod tests {
 
     #[test]
     fn is_transcript_accepts_transcript_docx_only() {
-        // Fix lane rule 3: docx/doc + `transcript` in the stem.
+        // Rule 3: docx/doc + `transcript` in the stem.
         assert!(is_transcript("Weekly Sync transcript.docx", None));
         assert!(is_transcript(
             "Weekly Sync transcript.docx",
@@ -716,7 +715,7 @@ mod tests {
         ));
         assert!(is_transcript("Meeting TRANSCRIPTION.doc", None)); // case + -ion
         assert!(is_transcript("a.DOCX", Some("text/vtt"))); // rule 2 still wins
-        // The build lane's 7 unrelated .docx still filter out:
+        // The 7 unrelated .docx from the live probe still filter out:
         assert!(!is_transcript("notes.docx", None));
         assert!(!is_transcript(
             "notes.docx",
