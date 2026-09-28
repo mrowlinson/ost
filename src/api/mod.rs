@@ -14,7 +14,9 @@ use anyhow::Result;
 // Re-export data types for TUI integration
 // Re-exported for future TUI callers; unused by the CLI today.
 #[allow(unused_imports)]
-pub use calendar::{JoinTarget, LobbyEvent, LobbyState, MeetingInfo};
+pub use calendar::{
+    JoinIdResolve, JoinTarget, LobbyEvent, LobbyState, MeetingInfo, ResolvedJoinId,
+};
 pub use chat::{ChatInfo, MessageInfo};
 pub use me::UserInfo;
 pub use presence::PresenceInfo;
@@ -28,8 +30,9 @@ pub use teams::ChannelInfo;
 // Re-export data-returning functions for TUI integration
 #[allow(unused_imports)]
 pub use calendar::{
-    calendar_view_path, list_upcoming_meetings_data, lobby_next, parse_calendar_view,
-    parse_join_url,
+    calendar_view_path, list_upcoming_meetings_data, lobby_next, normalize_join_meeting_id,
+    online_meeting_by_join_id_path, parse_calendar_view, parse_join_id_lookup, parse_join_url,
+    resolve_join_meeting_id_data,
 };
 pub use calweek::{
     calweek_view_path, cancel_meeting_data, list_week_meetings_data, parse_created_event,

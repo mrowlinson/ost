@@ -66,6 +66,9 @@ struct CalendarEvent {
     organizer: Option<OrganizerInfo>,
     #[serde(rename = "webLink")]
     web_link: Option<String>,
+    /// Graph `isOrganizer`: true when the signed-in user organizes it.
+    #[serde(rename = "isOrganizer")]
+    is_organizer: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -84,6 +87,11 @@ pub struct MeetingInfo {
     pub join_url: Option<String>,
     /// Organizer display name, when set.
     pub organizer: Option<String>,
+    /// Organizer SMTP address (`organizer.emailAddress.address`), when set.
+    pub organizer_email: Option<String>,
+    /// Graph `isOrganizer`: the signed-in user organizes this event.
+    /// Identity-based (not a display-name match); false when absent.
+    pub is_organizer: bool,
     /// True when Graph flags the event as an online meeting.
     pub is_online: bool,
 }
@@ -105,8 +113,15 @@ fn meeting_info(e: CalendarEvent) -> MeetingInfo {
         join_url,
         organizer: e
             .organizer
+            .as_ref()
+            .and_then(|o| o.emailAddress.as_ref())
+            .and_then(|a| a.name.clone()),
+        organizer_email: e
+            .organizer
             .and_then(|o| o.emailAddress)
-            .and_then(|a| a.name),
+            .and_then(|a| a.address)
+            .filter(|a| !a.trim().is_empty()),
+        is_organizer: e.is_organizer.unwrap_or(false),
         is_online: e.is_online_meeting.unwrap_or(false),
     }
 }
@@ -180,7 +195,7 @@ pub fn calendar_view_path(now: u64, days: u64, limit: usize) -> String {
     format!(
         "/me/calendar/calendarView?startDateTime={}&endDateTime={}&$top={}\
          &$orderby=start/dateTime\
-         &$select=id,subject,isOnlineMeeting,onlineMeeting,start,end,organizer,webLink",
+         &$select=id,subject,isOnlineMeeting,onlineMeeting,start,end,organizer,webLink,isOrganizer",
         encode_param(&start),
         encode_param(&end),
         limit
@@ -240,6 +255,132 @@ pub async fn list_upcoming_meetings(limit: usize) -> Result<()> {
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Join by meeting ID + passcode (Graph onlineMeetings joinMeetingId filter)
+// ---------------------------------------------------------------------------
+
+/// Normalize a typed Teams meeting ID (`"123 456 789 012"`) to its digits.
+/// None unless it is 9..=15 ASCII digits once whitespace is dropped (the
+/// same bounds the join sheet accepts).
+pub fn normalize_join_meeting_id(raw: &str) -> Option<String> {
+    let digits: String = raw.chars().filter(|c| !c.is_whitespace()).collect();
+    if (9..=15).contains(&digits.len()) && digits.bytes().all(|b| b.is_ascii_digit()) {
+        Some(digits)
+    } else {
+        None
+    }
+}
+
+/// Graph lookup path for one numeric meeting ID (digits only; callers
+/// normalize first). Pure so tests pin the query shape.
+pub fn online_meeting_by_join_id_path(join_meeting_id: &str) -> String {
+    format!(
+        "/me/onlineMeetings?$filter=joinMeetingIdSettings/joinMeetingId%20eq%20'{}'",
+        join_meeting_id
+    )
+}
+
+#[derive(Debug, Deserialize)]
+struct JoinIdSettings {
+    #[serde(rename = "isPasscodeRequired")]
+    is_passcode_required: Option<bool>,
+    passcode: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OnlineMeetingById {
+    #[serde(rename = "joinWebUrl")]
+    join_web_url: Option<String>,
+    subject: Option<String>,
+    #[serde(rename = "joinMeetingIdSettings")]
+    join_meeting_id_settings: Option<JoinIdSettings>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OnlineMeetingsById {
+    #[serde(default)]
+    value: Vec<OnlineMeetingById>,
+}
+
+/// A meeting ID resolved to its join URL (feeds the existing join path).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedJoinId {
+    /// `joinWebUrl` (a `/l/meetup-join/19:meeting_…` link).
+    pub join_web_url: String,
+    pub subject: Option<String>,
+    pub passcode_required: bool,
+}
+
+/// Outcome of a join-by-ID lookup.
+#[derive(Debug, Clone, PartialEq)]
+pub enum JoinIdResolve {
+    Found(ResolvedJoinId),
+    /// Graph returned no meeting for the ID. `/me/onlineMeetings` only
+    /// sees meetings the signed-in user organizes or is invited to, so
+    /// an outside meeting lands here (embedders fall back to the web
+    /// `/meet/<id>?p=` link).
+    NotFound,
+    /// Graph disclosed the passcode and the typed one differs.
+    PasscodeMismatch,
+}
+
+/// Parse one joinMeetingId lookup body and check the passcode. Graph only
+/// returns `passcode` to some callers (e.g. the organizer); when it is
+/// absent the typed passcode cannot be checked here and the join proceeds
+/// (the service enforces it). Pure.
+pub fn parse_join_id_lookup(json: &str, passcode: &str) -> Result<JoinIdResolve> {
+    let resp: OnlineMeetingsById =
+        serde_json::from_str(json).context("Failed to parse onlineMeetings response")?;
+    let Some(m) = resp.value.into_iter().find(|m| {
+        m.join_web_url
+            .as_deref()
+            .map(|u| !u.trim().is_empty())
+            .unwrap_or(false)
+    }) else {
+        return Ok(JoinIdResolve::NotFound);
+    };
+    let settings = m.join_meeting_id_settings;
+    let known = settings
+        .as_ref()
+        .and_then(|s| s.passcode.as_deref())
+        .map(str::trim)
+        .filter(|p| !p.is_empty());
+    let required = settings
+        .as_ref()
+        .and_then(|s| s.is_passcode_required)
+        .unwrap_or(known.is_some());
+    if let Some(expected) = known {
+        if expected != passcode.trim() {
+            return Ok(JoinIdResolve::PasscodeMismatch);
+        }
+    }
+    Ok(JoinIdResolve::Found(ResolvedJoinId {
+        join_web_url: m.join_web_url.unwrap_or_default().trim().to_string(),
+        subject: m.subject.filter(|s| !s.trim().is_empty()),
+        passcode_required: required,
+    }))
+}
+
+/// Resolve a typed meeting ID + passcode to the meeting's join URL via
+/// Graph (`OnlineMeetings.Read`). Bails pre-network on a malformed ID.
+pub async fn resolve_join_meeting_id_data(
+    client: &TeamsClient,
+    meeting_id: &str,
+    passcode: &str,
+) -> Result<JoinIdResolve> {
+    let Some(id) = normalize_join_meeting_id(meeting_id) else {
+        anyhow::bail!("meeting ID must be 9-15 digits");
+    };
+    let resp = client
+        .graph_get(&online_meeting_by_join_id_path(&id))
+        .await?;
+    let body = resp
+        .text()
+        .await
+        .context("Failed to read onlineMeetings response")?;
+    parse_join_id_lookup(&body, passcode)
 }
 
 // ---------------------------------------------------------------------------
@@ -627,5 +768,69 @@ mod tests {
             assert_eq!(LobbyState::from_str(s.as_str()), s);
         }
         assert_eq!(LobbyState::from_str("bogus"), LobbyState::Idle);
+    }
+
+    #[test]
+    fn join_by_meeting_id_normalize_path_and_lookup() {
+        assert_eq!(
+            normalize_join_meeting_id("123 456 789 012").as_deref(),
+            Some("123456789012")
+        );
+        for bad in ["", "12345678", "1234567890123456", "12a456789", "\u{ff11}\u{ff12}\u{ff13}\u{ff14}\u{ff15}\u{ff16}\u{ff17}\u{ff18}\u{ff19}"] {
+            assert!(normalize_join_meeting_id(bad).is_none(), "{bad}");
+        }
+        assert_eq!(
+            online_meeting_by_join_id_path("123456789012"),
+            "/me/onlineMeetings?$filter=joinMeetingIdSettings/joinMeetingId%20eq%20'123456789012'"
+        );
+        let url = "https://teams.microsoft.com/l/meetup-join/19%3ameeting_X%40thread.v2/0";
+        let body = format!(
+            r#"{{"value":[{{"subject":"Sync","joinWebUrl":"{url}",
+              "joinMeetingIdSettings":{{"isPasscodeRequired":true,
+              "joinMeetingId":"123456789012","passcode":"aB3x"}}}}]}}"#
+        );
+        assert_eq!(
+            parse_join_id_lookup(&body, " aB3x ").unwrap(),
+            JoinIdResolve::Found(ResolvedJoinId {
+                join_web_url: url.to_string(),
+                subject: Some("Sync".to_string()),
+                passcode_required: true,
+            })
+        );
+        assert_eq!(
+            parse_join_id_lookup(&body, "ab3x").unwrap(),
+            JoinIdResolve::PasscodeMismatch
+        );
+        // Passcode withheld by Graph: cannot be checked here, join proceeds.
+        let hidden = body.replace(r#""passcode":"aB3x""#, r#""passcode":null"#);
+        assert!(matches!(
+            parse_join_id_lookup(&hidden, "anything").unwrap(),
+            JoinIdResolve::Found(_)
+        ));
+        assert_eq!(
+            parse_join_id_lookup(r#"{"value":[]}"#, "x").unwrap(),
+            JoinIdResolve::NotFound
+        );
+        assert!(parse_join_id_lookup("not json", "").is_err());
+    }
+
+    #[test]
+    fn is_organizer_and_organizer_email_parse() {
+        let body = r#"{"value":[
+          {"id":"A","subject":"Mine","isOrganizer":true,
+           "organizer":{"emailAddress":{"name":"Me","address":"me@x.io"}}},
+          {"id":"B","subject":"Theirs","isOrganizer":false,
+           "organizer":{"emailAddress":{"name":"Doe, Jane","address":"j@x.io"}}},
+          {"id":"C","subject":"Absent"}
+        ]}"#;
+        let ms = parse_calendar_view(body).unwrap();
+        assert!(ms[0].is_organizer);
+        assert_eq!(ms[0].organizer_email.as_deref(), Some("me@x.io"));
+        assert!(!ms[1].is_organizer);
+        assert_eq!(ms[1].organizer_email.as_deref(), Some("j@x.io"));
+        assert!(!ms[2].is_organizer);
+        assert!(ms[2].organizer_email.is_none());
+        assert!(calendar_view_path(0, 7, 50).contains(",isOrganizer"));
+        assert!(crate::api::calweek::calweek_view_path(0, 7, 50).contains(",isOrganizer"));
     }
 }

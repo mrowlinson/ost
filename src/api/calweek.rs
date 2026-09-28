@@ -76,7 +76,7 @@ pub fn calweek_view_path(start_secs: u64, days: u64, limit: usize) -> String {
     format!(
         "/me/calendar/calendarView?startDateTime={}&endDateTime={}&$top={}\
          &$orderby=start/dateTime\
-         &$select=id,subject,isOnlineMeeting,onlineMeeting,start,end,organizer,webLink",
+         &$select=id,subject,isOnlineMeeting,onlineMeeting,start,end,organizer,webLink,isOrganizer",
         encode_param(&start),
         encode_param(&end),
         limit
