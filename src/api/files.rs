@@ -276,10 +276,12 @@ pub async fn list_chat_files_data_opts(
 
 /// True when `id` is chat-shaped: group/meeting `19:…@thread.v2`, 1:1
 /// `19:…@unq.gbl.spaces`, legacy `@thread.skype`, or the `48:` self and
-/// system conversations. Channel ids (`@thread.tacv2`) are not.
+/// system conversations, or a bare `28:` bot id (legacy bot 1:1 chats).
+/// Channel ids (`@thread.tacv2`) are not.
 pub fn is_chat_id(id: &str) -> bool {
     let id = id.trim();
     id.starts_with("48:")
+        || id.starts_with("28:") // legacy bot one-to-one chats
         || (id.starts_with("19:")
             && ["@thread.v2", "@unq.gbl.spaces", "@thread.skype"].iter().any(|s| id.ends_with(s)))
 }
@@ -299,6 +301,18 @@ async fn list_via_chat_service(
     include_folders: bool,
 ) -> Result<Vec<SharedFile>> {
     let refs = crate::api::chat::chat_file_refs_data(client, chat_id, limit.max(1), CHAT_FILE_PAGES).await?;
+    Ok(resolve_file_refs(client, refs, include_folders).await)
+}
+
+/// Chat-service file refs → Shared files: each resolved through
+/// `/shares/{id}/driveItem` (share link first, then the object URL);
+/// unresolvable refs list from their metadata (open-only). Deduped by
+/// driveItem id; each keeps its message attachment id.
+async fn resolve_file_refs(
+    client: &TeamsClient,
+    refs: Vec<crate::api::chat::ChatFileRef>,
+    include_folders: bool,
+) -> Vec<SharedFile> {
     let mut files = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for r in refs {
@@ -330,7 +344,7 @@ async fn list_via_chat_service(
         };
         files.push(file);
     }
-    Ok(files)
+    files
 }
 
 /// A chat file that did not resolve to a driveItem, from its message
@@ -458,14 +472,24 @@ pub fn message_path(conversation_id: &str, message_id: &str, team_id: Option<&st
 /// The files one message shares: its `reference` attachments resolved
 /// to driveItems, each tagged with the attachment's own id (the
 /// `<attachment id>` in the body) so a caller can match it even
-/// past the first page of the Shared list. Chats read
-/// `/me/chats/{c}/messages/{m}`; channel ids (`@thread.tacv2`) read the
-/// channel post under its team. Folders are skipped.
+/// past the first page of the Shared list. Chat ids read the chat
+/// service (Graph `/me/chats/{c}/messages/{m}` returns 403 without
+/// Chat.Read); other non-channel ids read Graph; channel ids
+/// (`@thread.tacv2`) read the channel post under its team. Folders are
+/// skipped.
 pub async fn list_message_files_data(
     client: &TeamsClient,
     conversation_id: &str,
     message_id: &str,
 ) -> Result<Vec<SharedFile>> {
+    if is_chat_id(conversation_id) {
+        message_path(conversation_id, message_id, None)?; // guard ids pre-network
+        let refs = crate::api::chat::chat_message_file_refs_data(
+            client, conversation_id, message_id, CHAT_FILE_PAGES,
+        )
+        .await?;
+        return Ok(resolve_file_refs(client, refs, false).await);
+    }
     let team = if is_channel_id(conversation_id) {
         message_path(conversation_id, message_id, Some("t"))?; // guard ids pre-network
         Some(find_team_for_channel(client, conversation_id.trim()).await?)
@@ -982,6 +1006,7 @@ mod tests {
         assert!(is_chat_id("19:a_b@unq.gbl.spaces"));
         assert!(is_chat_id("19:old@thread.skype"));
         assert!(is_chat_id("48:notes"));
+        assert!(is_chat_id("28:1a2b3c4d-bot"));
         assert!(!is_chat_id("19:general@thread.tacv2"));
         assert!(!is_chat_id("general"));
         assert!(!is_chat_id(""));

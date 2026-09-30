@@ -420,6 +420,89 @@ pub fn parse_chat_file_refs(page: &serde_json::Value) -> (Vec<ChatFileRef>, Opti
     (out, back)
 }
 
+/// The files one chat-service message shares, from a single
+/// message object (`GET …/messages/{id}`) or a page holding it. Pure.
+pub fn message_file_refs(value: &serde_json::Value, message_id: &str) -> Option<Vec<ChatFileRef>> {
+    let want = message_id.trim();
+    let one = |m: &serde_json::Value| {
+        let id = m["id"].as_str().or_else(|| m["clientmessageid"].as_str()).unwrap_or("");
+        id == want
+    };
+    let msg = if let Some(list) = value["messages"].as_array() {
+        list.iter().find(|m| one(m))?.clone()
+    } else if one(value) {
+        value.clone()
+    } else {
+        return None;
+    };
+    Some(parse_chat_file_refs(&serde_json::json!({ "messages": [msg] })).0)
+}
+
+/// Chat-service message ids are the arrival time in ms: a history page
+/// whose oldest message is newer than `message_id` must go further
+/// back. Pure.
+pub fn page_reaches(page: &serde_json::Value, message_id: &str) -> bool {
+    let Ok(want) = message_id.trim().parse::<i64>() else { return true };
+    page["messages"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|m| m["id"].as_str()?.parse::<i64>().ok()).any(|id| id <= want))
+        .unwrap_or(true)
+}
+
+/// The files one chat message shares, read from the chat
+/// service (the Graph message route needs Chat.Read: 403 on the Teams
+/// web token). Single-message GET first, then a history walk of at most
+/// `max_pages` pages until the page reaching the message. GET only.
+pub async fn chat_message_file_refs_data(
+    client: &TeamsClient,
+    chat_id: &str,
+    message_id: &str,
+    max_pages: usize,
+) -> Result<Vec<ChatFileRef>> {
+    let (chat_id, message_id) = (chat_id.trim(), message_id.trim());
+    let bad = |s: &str| s.is_empty() || s.contains(['/', '?', '#', ' ']);
+    if bad(chat_id) || bad(message_id) {
+        bail!("bad chat or message id");
+    }
+    let one = format!(
+        "{}/v1/users/ME/conversations/{}/messages/{}",
+        client.chat_service_url(),
+        chat_id,
+        message_id
+    );
+    if let Ok(resp) = client.chat_get(&one).await {
+        if let Ok(v) = resp.json::<serde_json::Value>().await {
+            if let Some(refs) = message_file_refs(&v, message_id) {
+                return Ok(refs);
+            }
+        }
+    }
+    let mut url = format!(
+        "{}/v1/users/ME/conversations/{}/messages?pageSize={}",
+        client.chat_service_url(),
+        chat_id,
+        CHAT_FILES_PAGE_SIZE
+    );
+    for _ in 0..max_pages.max(1) {
+        let page: serde_json::Value = client
+            .chat_get(&url)
+            .await?
+            .json()
+            .await
+            .context("Failed to parse messages response")?;
+        if let Some(refs) = message_file_refs(&page, message_id) {
+            return Ok(refs);
+        }
+        let back = page["_metadata"]["backwardLink"].as_str().map(str::to_string);
+        let empty = page["messages"].as_array().map_or(true, |a| a.is_empty());
+        match back {
+            Some(b) if !empty && !page_reaches(&page, message_id) => url = b,
+            _ => break,
+        }
+    }
+    bail!("message not found in chat history")
+}
+
 /// Files shared in a chat, newest first, deduplicated by file URL: walks
 /// chat-service history pages (newest first) until `limit` files or
 /// `max_pages` pages. Read-only GETs.
@@ -468,6 +551,28 @@ pub async fn chat_file_refs_data(
 #[cfg(test)]
 mod chat_files_tests {
     use super::*;
+
+    #[test]
+    fn message_file_refs_single_and_page() {
+        let files = r#"[{"id":"att-1","fileName":"Plan.docx","objectUrl":"https://c.sharepoint.com/Plan.docx","fileInfo":{"shareUrl":"https://c.sharepoint.com/:w:/s/x"}}]"#;
+        let msg = serde_json::json!({"id":"1700000000500","imdisplayname":"Ava Hart",
+            "originalarrivaltime":"2026-09-28T10:00:00Z","properties":{"files":files}});
+        let refs = message_file_refs(&msg, "1700000000500").unwrap();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].attachment_id.as_deref(), Some("att-1"));
+        assert_eq!(refs[0].share_url.as_deref(), Some("https://c.sharepoint.com/:w:/s/x"));
+        assert!(message_file_refs(&msg, "999").is_none());
+        let page = serde_json::json!({"messages":[
+            {"id":"1700000000900","properties":{}}, msg.clone(), {"id":"1700000000100"}]});
+        assert_eq!(message_file_refs(&page, "1700000000500").unwrap().len(), 1);
+        assert!(message_file_refs(&page, "1700000000400").is_none());
+        // A message without files yields an empty list, not a miss.
+        assert_eq!(message_file_refs(&page, "1700000000900").unwrap().len(), 0);
+        // History walk stops once a page reaches the message's time.
+        assert!(page_reaches(&page, "1700000000400"));
+        let newer = serde_json::json!({"messages":[{"id":"1700000000900"}]});
+        assert!(!page_reaches(&newer, "1700000000400"));
+    }
 
     #[test]
     fn file_refs_from_chat_service_page() {
