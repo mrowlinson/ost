@@ -3,7 +3,7 @@
 //! Uses the Skype token with `Authentication: skypetoken={token}` header,
 //! bypassing Graph API which requires tenant admin consent for Chat.Read.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
 use super::client::TeamsClient;
@@ -503,6 +503,229 @@ fn with_page_size(url: &str, limit: usize) -> String {
         .map(|i| val_start + i)
         .unwrap_or(url.len());
     format!("{}{}{}", &url[..val_start], limit, &url[val_end..])
+}
+
+// ---------------------------------------------------------------------------
+// Chat list actions: mute, hide, folders
+// ---------------------------------------------------------------------------
+//
+// Mute: the per-user conversation property `alerts` on the chat service
+// (`"false"` = muted, `"true"` = notify), the same property the chat list
+// returns under `properties.alerts`. Hide: Graph v1.0
+// `POST /chats/{id}/hideForUser` / `unhideForUser`. Folders: the chat
+// service aggregator's `conversationFolders` (read-only here), which needs
+// an AAD token for `https://chatsvcagg.teams.microsoft.com`.
+
+/// PUT target for one conversation's `alerts` property.
+pub fn alerts_url(base: &str, chat_id: &str) -> String {
+    format!(
+        "{}/v1/users/ME/conversations/{}/properties?name=alerts",
+        base, chat_id
+    )
+}
+
+/// PUT body: muted chats carry `"false"` (the server stores strings).
+pub fn alerts_body(muted: bool) -> serde_json::Value {
+    serde_json::json!({ "alerts": if muted { "false" } else { "true" } })
+}
+
+/// Muted state from a conversation's `properties` object: `Some(true)`
+/// for `alerts: "false"`, `Some(false)` for `"true"`, None when absent.
+pub fn alerts_muted(properties: &serde_json::Value) -> Option<bool> {
+    match properties.get("alerts")?.as_str()?.trim().to_ascii_lowercase().as_str() {
+        "false" => Some(true),
+        "true" => Some(false),
+        _ => None,
+    }
+}
+
+/// Mute or unmute one chat for the signed-in user.
+pub async fn set_chat_muted_with_client(client: &TeamsClient, chat_id: &str, muted: bool) -> Result<()> {
+    let id = chat_id.trim();
+    if id.is_empty() {
+        bail!("empty chat_id");
+    }
+    let url = alerts_url(&client.chat_service_url(), id);
+    client.chat_put(&url, &alerts_body(muted)).await?;
+    Ok(())
+}
+
+/// Graph path for hiding (`hideForUser`) or showing (`unhideForUser`).
+pub fn hide_chat_path(chat_id: &str, hidden: bool) -> String {
+    let verb = if hidden { "hideForUser" } else { "unhideForUser" };
+    format!("/chats/{}/{}", chat_id.trim(), verb)
+}
+
+/// Graph body naming the user the chat is hidden for.
+pub fn hide_chat_body(user_id: &str, tenant_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "user": {
+            "@odata.type": "#microsoft.graph.teamworkUserIdentity",
+            "id": user_id.trim(),
+            "tenantId": tenant_id.trim(),
+        }
+    })
+}
+
+/// Hide or unhide one chat for the signed-in user (`user_id` = Entra
+/// object id, `tenant_id` = home tenant).
+pub async fn set_chat_hidden_with_client(
+    client: &TeamsClient,
+    chat_id: &str,
+    user_id: &str,
+    tenant_id: &str,
+    hidden: bool,
+) -> Result<()> {
+    if chat_id.trim().is_empty() {
+        bail!("empty chat_id");
+    }
+    if user_id.trim().is_empty() || tenant_id.trim().is_empty() {
+        bail!("missing user identity");
+    }
+    client
+        .graph_post(&hide_chat_path(chat_id, hidden), &hide_chat_body(user_id, tenant_id))
+        .await?;
+    Ok(())
+}
+
+/// Chat service aggregator resource for folder reads.
+pub const CHATSVCAGG_SCOPE: &str = "https://chatsvcagg.teams.microsoft.com/.default";
+
+/// Folder list URL (system folders included so Favorites comes back).
+pub fn conversation_folders_url() -> String {
+    "https://teams.microsoft.com/api/csa/api/v1/teams/users/me/conversationFolders?supportsAdditionalSystemGeneratedFolders=true&supportsSliceItems=true".to_string()
+}
+
+/// Server folder types that are views, not folders a chat is moved into.
+pub const SYSTEM_FOLDER_TYPES: &[&str] = &[
+    "RecentChats",
+    "TeamsAndChannels",
+    "QuickViews",
+    "MutedChats",
+    "MeetingChats",
+    "EngageCommunities",
+];
+
+/// One chat folder from the server: Favorites and user folders.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationFolder {
+    pub id: String,
+    pub name: String,
+    pub folder_type: String,
+    /// Conversation ids in folder order (chats and channels alike).
+    pub item_ids: Vec<String>,
+}
+
+/// Parse a `conversationFolders` payload: deleted and system folders
+/// dropped, blank ids dropped, `conversationFolderOrder` order first
+/// (folders it omits keep payload order after it).
+pub fn parse_conversation_folders(v: &serde_json::Value) -> Vec<ConversationFolder> {
+    let mut out: Vec<ConversationFolder> = Vec::new();
+    for f in v.get("conversationFolders").and_then(|x| x.as_array()).into_iter().flatten() {
+        let s = |k: &str| f.get(k).and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+        let (id, folder_type) = (s("id"), s("folderType"));
+        if id.is_empty() || f.get("isDeleted").and_then(|x| x.as_bool()).unwrap_or(false) {
+            continue;
+        }
+        if SYSTEM_FOLDER_TYPES.iter().any(|t| t.eq_ignore_ascii_case(&folder_type)) {
+            continue;
+        }
+        let mut name = s("name");
+        if name.is_empty() {
+            name = folder_type.clone();
+        }
+        let item_ids = f
+            .get("conversationFolderItems")
+            .and_then(|x| x.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|i| i.get("conversationId").and_then(|x| x.as_str()))
+            .map(|x| x.trim().to_string())
+            .filter(|x| !x.is_empty())
+            .collect();
+        out.push(ConversationFolder { id, name, folder_type, item_ids });
+    }
+    let order: Vec<&str> = v
+        .get("conversationFolderOrder")
+        .and_then(|x| x.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|x| x.as_str())
+        .collect();
+    out.sort_by_key(|f| order.iter().position(|o| *o == f.id).unwrap_or(usize::MAX));
+    out
+}
+
+/// Read the signed-in user's chat folders with a chatsvcagg bearer token.
+pub async fn conversation_folders_data(bearer: &str) -> Result<Vec<ConversationFolder>> {
+    if bearer.trim().is_empty() {
+        bail!("no chat service aggregator token");
+    }
+    let url = conversation_folders_url();
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .bearer_auth(bearer)
+        .header("x-ms-client-version", "1415/24080616421")
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+        .context("conversationFolders GET failed")?;
+    let status = resp.status();
+    if !status.is_success() {
+        bail!("conversationFolders GET: {}", status);
+    }
+    let v: serde_json::Value = resp.json().await.context("Failed to parse conversationFolders")?;
+    Ok(parse_conversation_folders(&v))
+}
+
+#[cfg(test)]
+mod chatmenu_tests {
+    use super::*;
+
+    #[test]
+    fn alerts_request_shape() {
+        assert_eq!(
+            alerts_url("https://h", "19:a@thread.v2"),
+            "https://h/v1/users/ME/conversations/19:a@thread.v2/properties?name=alerts"
+        );
+        assert_eq!(alerts_body(true), serde_json::json!({"alerts": "false"}));
+        assert_eq!(alerts_body(false), serde_json::json!({"alerts": "true"}));
+        assert_eq!(alerts_muted(&serde_json::json!({"alerts": "false"})), Some(true));
+        assert_eq!(alerts_muted(&serde_json::json!({"alerts": "True"})), Some(false));
+        assert_eq!(alerts_muted(&serde_json::json!({"favorite": "true"})), None);
+    }
+
+    #[test]
+    fn hide_request_shape() {
+        assert_eq!(hide_chat_path(" 19:a@thread.v2 ", true), "/chats/19:a@thread.v2/hideForUser");
+        assert_eq!(hide_chat_path("19:a@thread.v2", false), "/chats/19:a@thread.v2/unhideForUser");
+        let b = hide_chat_body("oid-1", "tid-2");
+        assert_eq!(b["user"]["id"], "oid-1");
+        assert_eq!(b["user"]["tenantId"], "tid-2");
+        assert_eq!(b["user"]["@odata.type"], "#microsoft.graph.teamworkUserIdentity");
+    }
+
+    #[test]
+    fn folders_parse_drops_system_and_deleted_and_orders() {
+        let v = serde_json::json!({
+            "conversationFolderOrder": ["f-work", "f-fav", "f-recent"],
+            "conversationFolders": [
+                {"id": "f-fav", "name": "Favorites", "folderType": "Favorites",
+                 "conversationFolderItems": [{"conversationId": "19:a@thread.v2"}, {"conversationId": " "}]},
+                {"id": "f-recent", "name": "Chats", "folderType": "RecentChats", "conversationFolderItems": []},
+                {"id": "f-gone", "name": "Old", "folderType": "UserCreated", "isDeleted": true},
+                {"id": "f-work", "name": "Work", "folderType": "UserCreated",
+                 "conversationFolderItems": [{"conversationId": "19:b@unq.gbl.spaces"}]},
+                {"id": "", "name": "Blank", "folderType": "UserCreated"}
+            ]
+        });
+        let f = parse_conversation_folders(&v);
+        assert_eq!(f.iter().map(|x| x.id.as_str()).collect::<Vec<_>>(), ["f-work", "f-fav"]);
+        assert_eq!(f[0].item_ids, ["19:b@unq.gbl.spaces"]);
+        assert_eq!(f[1].item_ids, ["19:a@thread.v2"]);
+        assert!(parse_conversation_folders(&serde_json::json!({})).is_empty());
+        assert!(conversation_folders_url().contains("/conversationFolders?"));
+    }
 }
 
 #[cfg(test)]

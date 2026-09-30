@@ -11,6 +11,11 @@ mod teams;
 use anyhow::Result;
 
 // Re-export data types for TUI integration
+pub use chat::{
+    alerts_body, alerts_muted, alerts_url, conversation_folders_data, conversation_folders_url,
+    hide_chat_body, hide_chat_path, parse_conversation_folders, set_chat_hidden_with_client,
+    set_chat_muted_with_client, ConversationFolder, CHATSVCAGG_SCOPE, SYSTEM_FOLDER_TYPES,
+};
 pub use chat::{ChatInfo, MessageInfo, MessagesPage};
 pub use me::UserInfo;
 pub use presence::PresenceInfo;
