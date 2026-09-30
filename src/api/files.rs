@@ -681,13 +681,27 @@ async fn upload_to_chat(
         .graph_put_bytes(&upath, bytes, "application/octet-stream")
         .await?;
     let item: DriveItem = resp.json().await.context("Failed to parse upload response")?;
-    post_reference_message(
-        client,
-        &format!("/me/chats/{}/messages", chat_id),
-        &item,
-        filename,
-    )
-    .await?;
+    // The chat service leads (skypetoken; the Graph chat-message POST
+    // needs ChatMessage.Send, which the Teams web token may lack); a
+    // chat-service rejection falls back to the Graph reference post.
+    let svc = async {
+        let body = chat_service_file_body_for(&item, filename)?;
+        let url = format!("{}/v1/users/ME/conversations/{}/messages", client.chat_service_url(), chat_id);
+        client.chat_post(&url, &body).await?;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    if let Err(e) = svc {
+        tracing::debug!("chat-service file post failed, trying Graph: {:#}", e);
+        post_reference_message(
+            client,
+            &format!("/me/chats/{}/messages", chat_id),
+            &item,
+            filename,
+        )
+        .await
+        .map_err(|g| g.context(format!("chat-service file post also failed: {:#}", e)))?;
+    }
     Ok(shared_from_item(item, None))
 }
 
@@ -745,6 +759,75 @@ fn reference_attachment(item: &DriveItem, filename: &str) -> Result<serde_json::
     }))
 }
 
+/// SharePoint site root of a file URL (`…/personal/<u>/` or
+/// `…/sites/<s>/`), else the origin + `/`. Pure.
+pub fn file_base_url(object_url: &str) -> String {
+    let (scheme, rest) = object_url.split_once("://").unwrap_or(("https", object_url));
+    let mut parts = rest.split('/');
+    let host = parts.next().unwrap_or("");
+    let segs: Vec<&str> = parts.collect();
+    match segs.first() {
+        Some(&kind) if (kind == "personal" || kind == "sites" || kind == "teams") && segs.len() > 2 => {
+            format!("{}://{}/{}/{}/", scheme, host, kind, segs[1])
+        }
+        _ => format!("{}://{}/", scheme, host),
+    }
+}
+
+/// Chat-service POST body for a file message, the shape the
+/// Teams web client sends and `parse_chat_file_refs` reads back:
+/// `properties.files` is a JSON *string* of one
+/// `http://schema.skype.com/File` entry (`id`/`itemid` = the SharePoint
+/// unique id from the upload eTag, `objectUrl` = the file itself). The
+/// visible content is the file name (never an empty bubble). Pure.
+pub fn chat_service_file_body(attach_id: &str, object_url: &str, filename: &str) -> serde_json::Value {
+    let ext = filename.rsplit_once('.').map(|(_, e)| e.to_lowercase()).unwrap_or_default();
+    let base = file_base_url(object_url);
+    let file = serde_json::json!({
+        "@type": "http://schema.skype.com/File",
+        "version": 2,
+        "id": attach_id,
+        "baseUrl": base,
+        "type": ext,
+        "title": filename,
+        "state": "active",
+        "objectUrl": object_url,
+        "providerData": "",
+        "itemid": attach_id,
+        "fileName": filename,
+        "fileType": ext,
+        "fileInfo": {
+            "itemId": null,
+            "fileUrl": object_url,
+            "siteUrl": base,
+            "serverRelativeUrl": "",
+            "shareUrl": null,
+            "shareId": null
+        },
+        "botFileProperties": {},
+        "permissionScope": "users",
+        "filePreview": {},
+        "fileChicletState": {"serviceName": "p2p", "state": "active"}
+    });
+    serde_json::json!({
+        "content": format!("<p>{}</p>", html_escape_text(filename)),
+        "messagetype": "RichText/Html",
+        "contenttype": "text",
+        "properties": {"files": serde_json::Value::Array(vec![file]).to_string()}
+    })
+}
+
+fn html_escape_text(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+
+fn chat_service_file_body_for(item: &DriveItem, filename: &str) -> Result<serde_json::Value> {
+    let attachment = reference_attachment(item, filename)?;
+    let id = attachment["id"].as_str().unwrap_or("");
+    let url = attachment["contentUrl"].as_str().unwrap_or("");
+    Ok(chat_service_file_body(id, url, filename))
+}
+
 async fn post_reference_message(
     client: &TeamsClient,
     path: &str,
@@ -766,6 +849,36 @@ pub async fn upload_file(chat_id: &str, local_path: &str) -> Result<()> {
     let file = upload_file_data(&client, chat_id, local_path).await?;
     println!("Uploaded {} ({} bytes, id {})", file.name, file.size, file.id);
     Ok(())
+}
+
+#[cfg(test)]
+mod chat_file_send_tests {
+    use super::*;
+
+    #[test]
+    fn chat_service_file_body_round_trips_through_the_reader() {
+        let url = "https://contoso-my.sharepoint.com/personal/a_contoso_com/Documents/Microsoft Teams Chat Files/Q3 <Plan>.docx";
+        let b = chat_service_file_body("0f1e2d3c-aaaa-bbbb-cccc-000000000001", url, "Q3 <Plan>.docx");
+        assert_eq!(b["messagetype"], "RichText/Html");
+        assert_eq!(b["content"], "<p>Q3 &lt;Plan&gt;.docx</p>");
+        // files travels as a JSON string, like the Teams web client.
+        let files: serde_json::Value = serde_json::from_str(b["properties"]["files"].as_str().unwrap()).unwrap();
+        let f = &files[0];
+        assert_eq!(f["@type"], "http://schema.skype.com/File");
+        assert_eq!(f["id"], f["itemid"]);
+        assert_eq!(f["fileType"], "docx");
+        assert_eq!(f["baseUrl"], "https://contoso-my.sharepoint.com/personal/a_contoso_com/");
+        assert_eq!(f["fileInfo"]["fileUrl"], url);
+        // The chat-service reader sees exactly one file with this id and name.
+        let page = serde_json::json!({"messages": [{"id": "1", "properties": b["properties"].clone()}]});
+        let (refs, _) = crate::api::chat::parse_chat_file_refs(&page);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].name, "Q3 <Plan>.docx");
+        assert_eq!(refs[0].object_url, url);
+        assert_eq!(refs[0].attachment_id.as_deref(), Some("0f1e2d3c-aaaa-bbbb-cccc-000000000001"));
+        assert_eq!(file_base_url("https://h.sharepoint.com/sites/Eng/Shared Documents/x.pdf"), "https://h.sharepoint.com/sites/Eng/");
+        assert_eq!(file_base_url("https://h/x.pdf"), "https://h/");
+    }
 }
 
 #[cfg(test)]
