@@ -436,6 +436,148 @@ async fn resolve_mate_name(
         .next()
 }
 
+// ---------------------------------------------------------------------------
+// Batched, cached 1:1 mate names for chat-list paging
+// ---------------------------------------------------------------------------
+
+/// Concurrent mate lookups per page (each is a roster read + a history read).
+pub(crate) const MATE_CONCURRENCY: usize = 6;
+/// A cached mate name is trusted this long (renames are rare; a stale
+/// name heals on the next lookup after this).
+const MATE_TTL_SECS: u64 = 14 * 24 * 3600;
+
+/// Persisted chat id -> (mate display name, resolved-at epoch secs), kept
+/// in one file beside the config. Best effort: an unreadable or
+/// unwritable file just means the lookups run again.
+#[derive(Debug, Default)]
+pub(crate) struct MateNames {
+    names: std::collections::HashMap<String, (String, u64)>,
+    path: Option<std::path::PathBuf>,
+}
+
+impl MateNames {
+    pub(crate) fn load(path: Option<std::path::PathBuf>) -> Self {
+        let mut names = std::collections::HashMap::new();
+        if let Some(text) = path.as_ref().and_then(|p| std::fs::read_to_string(p).ok()) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                if let Some(obj) = v.as_object() {
+                    for (k, e) in obj {
+                        if let (Some(n), Some(t)) = (e.get(0).and_then(|x| x.as_str()), e.get(1).and_then(|x| x.as_u64())) {
+                            names.insert(k.clone(), (n.to_string(), t));
+                        }
+                    }
+                }
+            }
+        }
+        Self { names, path }
+    }
+
+    pub(crate) fn get(&self, chat_id: &str, now: u64) -> Option<String> {
+        self.names
+            .get(chat_id)
+            .filter(|(n, t)| !n.trim().is_empty() && now.saturating_sub(*t) < MATE_TTL_SECS)
+            .map(|(n, _)| n.clone())
+    }
+
+    pub(crate) fn put(&mut self, chat_id: &str, name: &str, now: u64) {
+        self.names.insert(chat_id.to_string(), (name.to_string(), now));
+    }
+
+    /// Write the map (temp file + rename). Errors are logged, never raised.
+    pub(crate) fn save(&self) {
+        let Some(path) = self.path.as_ref() else { return };
+        let obj: serde_json::Map<String, serde_json::Value> = self
+            .names
+            .iter()
+            .map(|(k, (n, t))| (k.clone(), serde_json::json!([n, t])))
+            .collect();
+        let tmp = path.with_extension("json.tmp");
+        let write = || -> std::io::Result<()> {
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            std::fs::write(&tmp, serde_json::Value::Object(obj).to_string())?;
+            std::fs::rename(&tmp, path)
+        };
+        if let Err(e) = write() {
+            tracing::debug!("mate name cache not saved: {}", e);
+        }
+    }
+}
+
+/// The process-wide mate name cache (loaded once from
+/// `mate-names.json` beside the config file).
+fn mate_cache() -> &'static std::sync::Mutex<MateNames> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<MateNames>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| {
+        let path = crate::config::Config::config_path()
+            .ok()
+            .map(|p| p.with_file_name("mate-names.json"));
+        std::sync::Mutex::new(MateNames::load(path))
+    })
+}
+
+fn epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Mate names for `ids` (untitled 1:1 threads): cache hits answer with no
+/// network; the misses are looked up together, `concurrency` at a time,
+/// and every name found is cached and saved once. A lookup that fails
+/// leaves that chat out (the caller keeps its fallback name).
+pub(crate) async fn resolve_mates_cached(
+    client: &TeamsClient,
+    ids: &[String],
+    me: &str,
+    cache: &std::sync::Mutex<MateNames>,
+    now: u64,
+    concurrency: usize,
+) -> std::collections::HashMap<String, String> {
+    use futures::StreamExt;
+    let mut out = std::collections::HashMap::new();
+    let mut misses: Vec<String> = Vec::new();
+    {
+        let g = cache.lock().unwrap_or_else(|e| e.into_inner());
+        for id in ids {
+            match g.get(id, now) {
+                Some(n) => {
+                    out.insert(id.clone(), n);
+                }
+                None => misses.push(id.clone()),
+            }
+        }
+    }
+    if misses.is_empty() {
+        return out;
+    }
+    let found: Vec<(String, Option<String>)> = futures::stream::iter(misses)
+        .map(|id| async move {
+            let name = resolve_mate_name(client, &id, me).await;
+            (id, name)
+        })
+        .buffer_unordered(concurrency.max(1))
+        .collect()
+        .await;
+    let mut g = cache.lock().unwrap_or_else(|e| e.into_inner());
+    let mut any = false;
+    for (id, name) in found {
+        if let Some(n) = name {
+            g.put(&id, &n, now);
+            out.insert(id, n);
+            any = true;
+        } else {
+            tracing::debug!("mate resolve failed for {}", id);
+        }
+    }
+    if any {
+        g.save();
+    }
+    out
+}
+
 /// List recent chats and return structured data.
 ///
 /// 1:1 chats without a topic are named after the mate (roster MRI
@@ -542,18 +684,31 @@ pub async fn list_chats_data(client: &TeamsClient, limit: usize) -> Result<Vec<C
         });
     }
 
-    // Second pass: 1:1 mate names via MRI resolve. One whoami for the
-    // owner OID, then per-chat roster + history attribution. Any
+    // Second pass: 1:1 mate names via MRI resolve. Cached names answer
+    // first; misses cost one whoami plus a roster + history read each,
+    // run MATE_CONCURRENCY at a time. Any
     // failure keeps the first-pass name — the list never fails here.
     if !needs_mate.is_empty() {
-        if let Ok(me) = whoami_data(client).await {
+        let cache = mate_cache();
+        let now = epoch_secs();
+        let ids: Vec<String> = needs_mate.iter().map(|&(ci, _)| chats[ci].id.clone()).collect();
+        // Cache hits need no whoami; only misses pay for it.
+        let cached_only = {
+            let g = cache.lock().unwrap_or_else(|e| e.into_inner());
+            ids.iter().all(|id| g.get(id, now).is_some())
+        };
+        let me_id = if cached_only {
+            Some(String::new())
+        } else {
+            whoami_data(client).await.ok().map(|m| m.id)
+        };
+        if let Some(me_id) = me_id {
+            let names =
+                resolve_mates_cached(client, &ids, &me_id, cache, now, MATE_CONCURRENCY).await;
             for (chat_idx, conv_idx) in needs_mate {
-                let chat_id = chats[chat_idx].id.clone();
-                if let Some(mate) = resolve_mate_name(client, &chat_id, &me.id).await {
+                if let Some(mate) = names.get(&chats[chat_idx].id) {
                     let conv = &conversations[conv_idx];
-                    chats[chat_idx].name = conversation_name(conv, Some(&mate));
-                } else {
-                    tracing::debug!("mate resolve failed for {}", chat_id);
+                    chats[chat_idx].name = conversation_name(conv, Some(mate));
                 }
             }
         }
@@ -836,5 +991,42 @@ src="x">"#));
             .filter_map(|m| m.id)
             .collect();
         assert_eq!(ids, vec!["8:orgid:self", "8:orgid:mate"]);
+    }
+}
+
+#[cfg(test)]
+mod mate_cache_tests {
+    use super::*;
+
+    #[test]
+    fn names_persist_across_a_reload_and_expire() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("mate-tests-{}", std::process::id()));
+        let path = dir.join("mate-names.json");
+        let mut c = MateNames::load(Some(path.clone()));
+        assert!(c.get("19:one@unq.gbl.spaces", 10).is_none());
+        c.put("19:one@unq.gbl.spaces", "Riley Stone", 10);
+        c.put("19:blank@unq.gbl.spaces", " ", 10);
+        c.save();
+        let back = MateNames::load(Some(path.clone()));
+        assert_eq!(back.get("19:one@unq.gbl.spaces", 20).as_deref(), Some("Riley Stone"));
+        assert!(back.get("19:blank@unq.gbl.spaces", 20).is_none(), "blank names never answer");
+        assert!(
+            back.get("19:one@unq.gbl.spaces", 10 + MATE_TTL_SECS + 1).is_none(),
+            "stale names are looked up again"
+        );
+        // Corrupt file: empty cache, no panic.
+        std::fs::write(&path, "not json").unwrap();
+        assert!(MateNames::load(Some(path)).get("19:one@unq.gbl.spaces", 20).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unsaved_cache_without_a_path_is_harmless() {
+        let mut c = MateNames::load(None);
+        c.put("19:a@unq.gbl.spaces", "Casey Morgan", 1);
+        c.save();
+        assert_eq!(c.get("19:a@unq.gbl.spaces", 2).as_deref(), Some("Casey Morgan"));
     }
 }
