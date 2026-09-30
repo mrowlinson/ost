@@ -594,7 +594,72 @@ pub async fn list_chat_members_data(
         .json()
         .await
         .context("Failed to parse thread members response")?;
-    Ok((RosterSource::ChatService, parse_thread_members(&v)?))
+    let mut members = parse_thread_members(&v)?;
+    fill_member_names(client, &mut members).await;
+    Ok((RosterSource::ChatService, members))
+}
+
+/// Chat-service rosters usually carry no names (MRIs and roles only).
+/// Blank names with an AAD object id are filled from Graph
+/// `GET /users/{oid}`, at most [`ROSTER_NAME_FILL_MAX`], a few at a time.
+/// A failed lookup leaves that member as it was; it never drops the member.
+pub const ROSTER_NAME_FILL_MAX: usize = 60;
+
+/// Graph path for one roster name lookup (pure).
+pub fn roster_user_path(oid: &str) -> String {
+    format!("/users/{}?$select=displayName,mail,userPrincipalName", oid.trim())
+}
+
+/// Apply one `/users/{oid}` answer to a member: only blanks are filled,
+/// a name or email the roster already had wins (pure).
+pub fn apply_roster_user(member: &mut ChatMemberInfo, user: &serde_json::Value) {
+    let text = |k: &str| user[k].as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+    if member.display_name.trim().is_empty() {
+        if let Some(n) = text("displayName") {
+            member.display_name = n;
+        }
+    }
+    if member.email.is_none() {
+        member.email = text("mail").or_else(|| text("userPrincipalName"));
+    }
+}
+
+fn looks_like_guid(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('-').collect();
+    parts.len() == 5
+        && [8, 4, 4, 4, 12].iter().zip(&parts).all(|(n, p)| p.len() == *n)
+        && s.chars().all(|c| c == '-' || c.is_ascii_hexdigit())
+}
+
+async fn fill_member_names(client: &TeamsClient, members: &mut [ChatMemberInfo]) {
+    let todo: Vec<usize> = members
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.display_name.trim().is_empty())
+        .filter(|(_, m)| m.user_id.as_deref().map(looks_like_guid).unwrap_or(false))
+        .map(|(i, _)| i)
+        .take(ROSTER_NAME_FILL_MAX)
+        .collect();
+    for chunk in todo.chunks(8) {
+        let reads = chunk.iter().map(|&i| {
+            let path = roster_user_path(members[i].user_id.as_deref().unwrap_or(""));
+            async move {
+                let v: Option<serde_json::Value> = match client.graph_get(&path).await {
+                    Ok(r) => r.json().await.ok(),
+                    Err(e) => {
+                        tracing::debug!("roster name lookup failed: {:#}", e);
+                        None
+                    }
+                };
+                (i, v)
+            }
+        });
+        for (i, v) in futures::future::join_all(reads).await {
+            if let Some(v) = v {
+                apply_roster_user(&mut members[i], &v);
+            }
+        }
+    }
 }
 
 /// List recent chats and return structured data.
@@ -1039,5 +1104,48 @@ src="x">"#));
         assert_eq!(m[2].user_id, None);
         assert!(m[2].roles.is_empty());
         assert_eq!(chat_members_path(" 19:g@thread.v2 "), "/chats/19:g@thread.v2/members");
+    }
+}
+
+#[cfg(test)]
+mod roster_name_tests {
+    use super::*;
+
+    fn member(mri: &str, name: &str) -> ChatMemberInfo {
+        ChatMemberInfo {
+            mri: mri.to_string(),
+            user_id: oid_from_orgid_mri(mri),
+            display_name: name.to_string(),
+            email: None,
+            roles: vec![],
+            is_owner: false,
+        }
+    }
+
+    #[test]
+    fn roster_blank_names_fill_from_users() {
+        assert_eq!(
+            roster_user_path(" 11111111-aaaa-4aaa-8aaa-111111111111 "),
+            "/users/11111111-aaaa-4aaa-8aaa-111111111111?$select=displayName,mail,userPrincipalName"
+        );
+        let mut m = member("8:orgid:11111111-aaaa-4aaa-8aaa-111111111111", "");
+        apply_roster_user(&mut m, &serde_json::json!({"displayName": "Ava Stone", "mail": null, "userPrincipalName": "ava@example.com"}));
+        assert_eq!(m.display_name, "Ava Stone");
+        assert_eq!(m.email.as_deref(), Some("ava@example.com"));
+        let mut named = member("8:orgid:11111111-aaaa-4aaa-8aaa-111111111111", "Kept Name");
+        apply_roster_user(&mut named, &serde_json::json!({"displayName": "Other", "mail": "k@example.com"}));
+        assert_eq!(named.display_name, "Kept Name");
+        assert_eq!(named.email.as_deref(), Some("k@example.com"));
+        let mut blank = member("8:orgid:11111111-aaaa-4aaa-8aaa-111111111111", "");
+        apply_roster_user(&mut blank, &serde_json::json!({"displayName": "  "}));
+        assert_eq!(blank.display_name, "");
+        assert_eq!(blank.email, None);
+    }
+
+    #[test]
+    fn only_guid_ids_are_looked_up() {
+        assert!(looks_like_guid("11111111-aaaa-4aaa-8aaa-111111111111"));
+        assert!(!looks_like_guid("not-a-guid"));
+        assert!(!looks_like_guid(""));
     }
 }
