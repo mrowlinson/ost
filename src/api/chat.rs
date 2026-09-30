@@ -756,6 +756,34 @@ src="x">"#));
         serde_json::from_str(json).unwrap()
     }
 
+ 
+    #[test]
+    fn bot_one_to_one_chats_list_like_teams() {
+        // Live-shaped bot 1:1 rows (mychats view): the current
+        // shape `19:{userOid}_{botAppId}@unq.gbl.spaces` and the legacy
+        // bare bot MRI `28:{botAppId}`. Both list as 1:1s named after the
+        // bot, never "[Direct message]" / a raw id.
+        let c = conv(
+            r#"{"id":"19:6b1f2c3d-aaaa-4bbb-8ccc-0d1e2f3a4b5c_7c8d9e0f-1111-4222-8333-444455556666@unq.gbl.spaces",
+                "threadProperties":{"uniquerosterthread":"true","productThreadType":"OneToOneChat"},
+                "lastMessage":{"imdisplayname":"Workflows","messagetype":"RichText/Html",
+                    "from":"https://x/v1/users/ME/contacts/28:7c8d9e0f-1111-4222-8333-444455556666",
+                    "content":"<div>Your approval is ready</div>"}}"#,
+        );
+        let id = c.id.as_deref().unwrap();
+        assert!(is_onetoone_id(id));
+        assert!(!(id.contains("thread") || id.contains("meeting")), "bot chat is not a group");
+        assert_eq!(conversation_name(&c, Some("Workflows")), "Workflows");
+        assert_eq!(conversation_name(&c, None), "Workflows");
+        let legacy = conv(
+            r#"{"id":"28:7c8d9e0f-1111-4222-8333-444455556666",
+                "lastMessage":{"imdisplayname":"Polly","messagetype":"Text","content":"Poll closed"}}"#,
+        );
+        let id = legacy.id.as_deref().unwrap();
+        assert!(!(id.contains("thread") || id.contains("meeting")));
+        assert_eq!(conversation_name(&legacy, None), "Polly");
+    }
+
     #[test]
     fn conversation_name_never_raw_id() {
         // Topic wins over everything.
