@@ -62,7 +62,7 @@ impl TeamsClient {
         Ok(token.token)
     }
 
-    fn skype_token(&self) -> Result<String> {
+    pub(crate) fn skype_token(&self) -> Result<String> {
         let token = self
             .config
             .get_skype_token()

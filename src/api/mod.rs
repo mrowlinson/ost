@@ -12,7 +12,8 @@ use anyhow::Result;
 
 // Re-export data types for TUI integration
 pub use chat::{
-    alerts_body, alerts_muted, alerts_url, conversation_folders_data, conversation_folders_url,
+    alerts_body, alerts_muted, alerts_url, conversation_folder_move_with_client,
+    conversation_folders_data, conversation_folders_url, folder_move_actions, folder_move_body,
     hide_chat_body, hide_chat_path, parse_conversation_folders, set_chat_hidden_with_client,
     set_chat_muted_with_client, ConversationFolder, CHATSVCAGG_SCOPE, SYSTEM_FOLDER_TYPES,
 };

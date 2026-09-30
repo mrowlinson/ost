@@ -678,9 +678,160 @@ pub async fn conversation_folders_data(bearer: &str) -> Result<Vec<ConversationF
     Ok(parse_conversation_folders(&v))
 }
 
+/// One folder edit: `("AddItem" | "RemoveItem", folder id, conversation id)`.
+pub type FolderAction = (&'static str, String, String);
+
+/// Pure: the edits that leave `chat_id` in `target` (blank = no folder)
+/// and in no other movable folder, from a raw `conversationFolders`
+/// payload. Returns `(folderHierarchyVersion, actions)`; no actions when
+/// the chat is already where it should be. System folders (views) are
+/// never edited; an unknown target is an error.
+pub fn folder_move_actions(
+    v: &serde_json::Value,
+    chat_id: &str,
+    target: &str,
+) -> Result<(i64, Vec<FolderAction>)> {
+    let version = v.get("folderHierarchyVersion").and_then(|x| x.as_i64()).unwrap_or(0);
+    let folders = parse_conversation_folders(v);
+    let target = target.trim();
+    if !target.is_empty() && !folders.iter().any(|f| f.id == target) {
+        bail!("unknown folder");
+    }
+    let mut actions: Vec<FolderAction> = Vec::new();
+    for f in &folders {
+        let holds = f.item_ids.iter().any(|i| i == chat_id);
+        if holds && f.id != target {
+            actions.push(("RemoveItem", f.id.clone(), chat_id.to_string()));
+        }
+        if !holds && f.id == target {
+            actions.push(("AddItem", f.id.clone(), chat_id.to_string()));
+        }
+    }
+    Ok((version, actions))
+}
+
+/// Folder edit POST body (same URL as the folder GET).
+pub fn folder_move_body(version: i64, actions: &[FolderAction]) -> serde_json::Value {
+    let list: Vec<serde_json::Value> = actions
+        .iter()
+        .map(|(action, folder, item)| {
+            serde_json::json!({"action": action, "folderId": folder, "itemId": item})
+        })
+        .collect();
+    serde_json::json!({"folderHierarchyVersion": version, "actions": list})
+}
+
+async fn conversation_folders_raw(bearer: &str) -> Result<serde_json::Value> {
+    let resp = reqwest::Client::new()
+        .get(conversation_folders_url())
+        .bearer_auth(bearer)
+        .header("x-ms-client-version", "1415/24080616421")
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+        .context("conversationFolders GET failed")?;
+    let status = resp.status();
+    if !status.is_success() {
+        bail!("conversationFolders GET: {}", status);
+    }
+    resp.json().await.context("Failed to parse conversationFolders")
+}
+
+/// Move one chat into `target` (blank = out of every folder): fresh GET
+/// for the version and membership, one POST with the edits, then check
+/// the returned folders. Returns the folders after the move; an answer
+/// that does not show the chat where it was asked to go is an error.
+pub async fn conversation_folder_move_with_client(
+    client: &TeamsClient,
+    bearer: &str,
+    chat_id: &str,
+    target: &str,
+) -> Result<Vec<ConversationFolder>> {
+    let chat_id = chat_id.trim();
+    if chat_id.is_empty() || bearer.trim().is_empty() {
+        bail!("missing chat id or token");
+    }
+    let current = conversation_folders_raw(bearer).await?;
+    let (version, actions) = folder_move_actions(&current, chat_id, target)?;
+    if actions.is_empty() {
+        return Ok(parse_conversation_folders(&current));
+    }
+    let skype = client.skype_token()?;
+    let resp = reqwest::Client::new()
+        .post(conversation_folders_url())
+        .bearer_auth(bearer)
+        .header("Authentication", format!("skypetoken={}", skype))
+        .header("x-ms-client-version", "1415/24080616421")
+        .json(&folder_move_body(version, &actions))
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+        .context("conversationFolders POST failed")?;
+    let status = resp.status();
+    if !status.is_success() {
+        bail!("conversationFolders POST: {}", status);
+    }
+    // The answer carries the folder state; re-read when it does not.
+    let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+    let after = if body.get("conversationFolders").is_some() {
+        body
+    } else {
+        conversation_folders_raw(bearer).await?
+    };
+    let (_, left) = folder_move_actions(&after, chat_id, target)?;
+    if !left.is_empty() {
+        bail!("folder move not applied");
+    }
+    Ok(parse_conversation_folders(&after))
+}
+
 #[cfg(test)]
 mod chatmenu_tests {
     use super::*;
+
+    fn folders_payload() -> serde_json::Value {
+        serde_json::json!({
+            "folderHierarchyVersion": 7,
+            "conversationFolders": [
+                {"id": "t~u~Favorites", "folderType": "Favorites",
+                 "conversationFolderItems": [{"conversationId": "19:a@thread.v2"}]},
+                {"id": "f1", "name": "Work", "folderType": "UserCreated",
+                 "conversationFolderItems": [{"conversationId": "48:notes"}]},
+                {"id": "q", "folderType": "QuickViews",
+                 "conversationFolderItems": [{"conversationId": "48:notes"}]}
+            ]
+        })
+    }
+
+    #[test]
+    fn folder_move_request_shape() {
+        let v = folders_payload();
+        let (version, actions) = folder_move_actions(&v, "48:notes", "t~u~Favorites").unwrap();
+        assert_eq!(version, 7);
+        // Out of the user folder, into Favorites; the QuickViews view is untouched.
+        assert_eq!(
+            actions,
+            vec![
+                ("AddItem", "t~u~Favorites".to_string(), "48:notes".to_string()),
+                ("RemoveItem", "f1".to_string(), "48:notes".to_string()),
+            ]
+        );
+        assert_eq!(
+            folder_move_body(version, &actions),
+            serde_json::json!({"folderHierarchyVersion": 7, "actions": [
+                {"action": "AddItem", "folderId": "t~u~Favorites", "itemId": "48:notes"},
+                {"action": "RemoveItem", "folderId": "f1", "itemId": "48:notes"}
+            ]})
+        );
+        // Blank target = out of every folder; already-there = no edits.
+        let (_, out) = folder_move_actions(&v, "48:notes", "").unwrap();
+        assert_eq!(out, vec![("RemoveItem", "f1".to_string(), "48:notes".to_string())]);
+        let (_, none) = folder_move_actions(&v, "19:a@thread.v2", "t~u~Favorites").unwrap();
+        assert!(none.is_empty());
+        // System views and unknown ids are not move targets.
+        assert!(folder_move_actions(&v, "48:notes", "q").is_err());
+        assert!(folder_move_actions(&v, "48:notes", "nope").is_err());
+    }
 
     #[test]
     fn alerts_request_shape() {
