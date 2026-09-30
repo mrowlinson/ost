@@ -252,6 +252,18 @@ pub async fn list_chat_files_data_opts(
             return Ok(files);
         }
         list_via_chat_messages(client, chat_id, limit, include_folders).await
+    } else if is_chat_id(chat_id) {
+        // Chat ids never fall back to the channel scan: its "No joined
+        // team contains channel" masked the real chat error.
+        // The chat service leads (the Graph message route needs
+        // Chat.Read, which the Teams web token lacks: 403); its error is
+        // the one surfaced when both fail.
+        match list_via_chat_service(client, chat_id, limit, include_folders).await {
+            Ok(files) => Ok(files),
+            Err(e) => list_via_chat_messages(client, chat_id, limit, include_folders)
+                .await
+                .map_err(|_| e),
+        }
     } else {
         if let Ok(files) =
             list_via_chat_messages(client, chat_id, limit, include_folders).await
@@ -259,6 +271,84 @@ pub async fn list_chat_files_data_opts(
             return Ok(files);
         }
         list_via_channel_folder(client, chat_id, limit, include_folders).await
+    }
+}
+
+/// True when `id` is chat-shaped: group/meeting `19:…@thread.v2`, 1:1
+/// `19:…@unq.gbl.spaces`, legacy `@thread.skype`, or the `48:` self and
+/// system conversations. Channel ids (`@thread.tacv2`) are not.
+pub fn is_chat_id(id: &str) -> bool {
+    let id = id.trim();
+    id.starts_with("48:")
+        || (id.starts_with("19:")
+            && ["@thread.v2", "@unq.gbl.spaces", "@thread.skype"].iter().any(|s| id.ends_with(s)))
+}
+
+/// Most chat-service history pages the Shared tab walks (200 each).
+const CHAT_FILE_PAGES: usize = 5;
+
+/// Chat Shared tab via the chat service: the files messages carry
+/// (`properties.files`), newest first, each resolved to its driveItem
+/// through `/shares/{id}/driveItem` (Files.ReadWrite.All). A file that
+/// will not resolve (deleted, no access) still lists from the message
+/// metadata: name, link, sender, time; no drive id (open-only).
+async fn list_via_chat_service(
+    client: &TeamsClient,
+    chat_id: &str,
+    limit: usize,
+    include_folders: bool,
+) -> Result<Vec<SharedFile>> {
+    let refs = crate::api::chat::chat_file_refs_data(client, chat_id, limit.max(1), CHAT_FILE_PAGES).await?;
+    let mut files = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for r in refs {
+        let mut item = None;
+        for u in [r.share_url.as_deref(), Some(r.object_url.as_str())].into_iter().flatten() {
+            let spath = format!("/shares/{}/driveItem", encode_share_id(u));
+            if let Ok(resp) = client.graph_get(&spath).await {
+                if let Ok(it) = resp.json::<DriveItem>().await {
+                    item = Some(it);
+                    break;
+                }
+            }
+        }
+        let file = match item {
+            Some(it) => {
+                if !keep_item(&it, include_folders) || !seen.insert(it.id.clone()) {
+                    continue;
+                }
+                let mut f = shared_from_item(it, r.sender.clone());
+                if f.name == "[unnamed]" {
+                    f.name = r.name.clone();
+                }
+                if f.attachment_id.is_none() {
+                    f.attachment_id = r.attachment_id.clone();
+                }
+                f
+            }
+            None => shared_from_ref(&r),
+        };
+        files.push(file);
+    }
+    Ok(files)
+}
+
+/// A chat file that did not resolve to a driveItem, from its message
+/// metadata alone (open-in-browser only: no drive id, no size).
+fn shared_from_ref(r: &crate::api::chat::ChatFileRef) -> SharedFile {
+    SharedFile {
+        id: r.attachment_id.clone().unwrap_or_else(|| r.object_url.clone()),
+        name: r.name.clone(),
+        size: 0,
+        mime: None,
+        web_url: Some(r.object_url.clone()),
+        download_url: None,
+        drive_id: None,
+        created: r.time.clone(),
+        modified: r.time.clone(),
+        sender: r.sender.clone(),
+        is_folder: false,
+        attachment_id: r.attachment_id.clone(),
     }
 }
 
@@ -883,6 +973,33 @@ mod tests {
         let missing: DriveItem =
             serde_json::from_str(r#"{"id":"i3","name":"h.docx"}"#).unwrap();
         assert_eq!(shared_from_item(missing, None).attachment_id, None);
+    }
+
+    #[test]
+    fn chat_scope_never_takes_the_channel_scan() {
+        assert!(is_chat_id("19:abc@thread.v2"));
+        assert!(is_chat_id(" 19:meeting_xyz@thread.v2 "));
+        assert!(is_chat_id("19:a_b@unq.gbl.spaces"));
+        assert!(is_chat_id("19:old@thread.skype"));
+        assert!(is_chat_id("48:notes"));
+        assert!(!is_chat_id("19:general@thread.tacv2"));
+        assert!(!is_chat_id("general"));
+        assert!(!is_chat_id(""));
+        let r = crate::api::chat::ChatFileRef {
+            attachment_id: Some("att-1".into()),
+            name: "Plan.docx".into(),
+            file_type: Some("docx".into()),
+            object_url: "https://contoso-my.sharepoint.com/personal/a/Documents/Plan.docx".into(),
+            share_url: None,
+            sender: Some("Alex Carter".into()),
+            time: Some("2026-09-28T09:00:00Z".into()),
+        };
+        let f = shared_from_ref(&r);
+        assert_eq!(f.id, "att-1");
+        assert_eq!(f.drive_id, None);
+        assert_eq!(f.web_url.as_deref(), Some(r.object_url.as_str()));
+        assert_eq!(f.attachment_id.as_deref(), Some("att-1"));
+        assert!(!f.is_folder);
     }
 
     #[test]
