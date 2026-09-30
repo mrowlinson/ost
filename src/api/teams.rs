@@ -759,6 +759,119 @@ pub async fn create_team_data(
     }
 }
 
+/// Middle-tier team create URL (`POST {mt}/beta/teams/create`, the web
+/// client's `createTeam`). Unlike Graph `POST /teams` it needs no
+/// `Team.Create` grant and answers synchronously.
+pub fn mt_create_team_url(mt: &str) -> String {
+    format!("{}/beta/teams/create", mt.trim_end_matches('/'))
+}
+
+/// Middle-tier team `accessType` (web client enum: None 0, Private 1,
+/// Secret 2, Public 3). New teams are Private, the web client's default.
+pub const TEAM_ACCESS_PRIVATE: u8 = 1;
+
+/// Middle-tier create body as the web client builds it for a team from
+/// scratch: `displayName`, `description` ("" when blank), `accessType`
+/// Private, `isTenantWide` and `validationRequired` false. Pure.
+pub fn mt_create_team_body(name: &str, description: Option<&str>) -> serde_json::Value {
+    let desc = description.map(str::trim).filter(|d| !d.is_empty()).unwrap_or("");
+    serde_json::json!({
+        "displayName": name.trim(),
+        "description": desc,
+        "accessType": TEAM_ACCESS_PRIVATE,
+        "isTenantWide": false,
+        "validationRequired": false,
+    })
+}
+
+/// Group id and team thread id from the middle-tier create answer. The
+/// web client reads `value` and takes the group id from
+/// `value.siteInfo.groupId` (`value.groupId` accepted too); the thread
+/// id is `value.skypeThreadId`. `None` without a group id. Pure.
+pub fn created_team_ids(v: &serde_json::Value) -> Option<(String, Option<String>)> {
+    let value = v.get("value").unwrap_or(v);
+    let text = |x: Option<&serde_json::Value>| {
+        x.and_then(|s| s.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+    };
+    let group = text(value.pointer("/siteInfo/groupId")).or_else(|| text(value.get("groupId")))?;
+    Some((group, text(value.get("skypeThreadId"))))
+}
+
+/// Create one standard (private) team through the Teams middle tier
+/// (`POST {mt}/beta/teams/create`, synchronous answer carrying the group
+/// id), then read it back with its channels from Graph. A fresh team
+/// Graph does not list yet degrades to the id + name with no channels
+/// (the next teams refresh fills them). The caller becomes the owner.
+/// Empty names are rejected before any network. Alternative to
+/// [`create_team_data`] for tokens without Graph `Team.Create`.
+pub async fn create_team_via_middle_tier(
+    client: &TeamsClient,
+    name: &str,
+    description: Option<&str>,
+) -> Result<TeamCreateResult> {
+    if name.trim().is_empty() {
+        bail!("empty name");
+    }
+    let started = std::time::Instant::now();
+    let url = mt_create_team_url(&client.middle_tier_url());
+    let v: serde_json::Value = client
+        .mt_send_json("POST", &url, &mt_create_team_body(name, description), None)
+        .await?
+        .json()
+        .await
+        .context("Failed to parse team create response")?;
+    let (group_id, _thread) =
+        created_team_ids(&v).context("team create answer carries no group id")?;
+    let team = match fetch_team_with_channels(client, &group_id, name).await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!("New team not readable from Graph yet: {:#}", e);
+            TeamInfo {
+                id: group_id,
+                name: name.trim().to_string(),
+                channels: Vec::new(),
+            }
+        }
+    };
+    Ok(TeamCreateResult {
+        team,
+        polls: 0,
+        elapsed_ms: started.elapsed().as_millis() as u64,
+    })
+}
+
+#[cfg(test)]
+mod mt_create_tests {
+    use super::*;
+
+    #[test]
+    fn team_create_goes_to_middle_tier_with_web_client_body() {
+        assert_eq!(
+            mt_create_team_url("https://teams.microsoft.com/api/mt/emea/"),
+            "https://teams.microsoft.com/api/mt/emea/beta/teams/create"
+        );
+        let b = mt_create_team_body("  Squad ", Some("  "));
+        assert_eq!(b["displayName"], "Squad");
+        assert_eq!(b["description"], "");
+        assert_eq!(b["accessType"], 1);
+        assert_eq!(b["isTenantWide"], false);
+        assert_eq!(b["validationRequired"], false);
+        assert_eq!(mt_create_team_body("S", Some(" Ship it "))["description"], "Ship it");
+    }
+
+    #[test]
+    fn created_ids_come_from_site_info_or_group_id() {
+        let v = serde_json::json!({"value": {"siteInfo": {"groupId": " g-1 "}, "skypeThreadId": "19:t@thread.tacv2"}});
+        assert_eq!(created_team_ids(&v), Some(("g-1".into(), Some("19:t@thread.tacv2".into()))));
+        let v = serde_json::json!({"value": {"groupId": "g-2"}});
+        assert_eq!(created_team_ids(&v), Some(("g-2".into(), None)));
+        assert_eq!(created_team_ids(&serde_json::json!({"value": {}})), None);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

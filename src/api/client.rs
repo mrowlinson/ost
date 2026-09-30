@@ -234,6 +234,31 @@ impl TeamsClient {
         check_response(resp, url).await
     }
 
+    /// JSON write against the Teams middle tier with the Teams web
+    /// client's own request shape: any method, JSON body, optional
+    /// `x-ms-client-caller` header. For the writes the web client makes
+    /// on the middle tier (team create, channel edit/delete, app install).
+    pub async fn mt_send_json(
+        &self,
+        verb: &'static str,
+        url: &str,
+        body: &serde_json::Value,
+        caller: Option<&str>,
+    ) -> Result<reqwest::Response> {
+        let method = reqwest::Method::from_bytes(verb.as_bytes())
+            .with_context(|| format!("bad method {}", verb))?;
+        tracing::debug!("MT {} {}", verb, url);
+        let mut req = self.mt_request(self.http.request(method, url))?.json(body);
+        if let Some(c) = caller {
+            req = req.header("x-ms-client-caller", c);
+        }
+        let resp = req
+            .send()
+            .await
+            .with_context(|| format!("MT {} {} failed", verb, url))?;
+        check_response(resp, url).await
+    }
+
     /// Chat service base URL from region_gtms, falling back to default.
     pub fn chat_service_url(&self) -> String {
         self.config
