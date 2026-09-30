@@ -198,6 +198,31 @@ pub fn message_url(base: &str, chat_id: &str, message_id: &str) -> String {
     )
 }
 
+/// JS `encodeURIComponent` (unreserved plus `!'()*` kept, rest %XX).
+fn encode_uri_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'!' | b'\''
+            | b'(' | b')' | b'*' => out.push(b as char),
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
+/// DELETE target for deleting one own message, exactly as the Teams web
+/// client sends it: `.../conversations/{encodeURIComponent(conv)}/messages/{id}?behavior=softDelete`.
+/// A bare DELETE (no `behavior`) is not what the web client does.
+pub fn message_delete_url(base: &str, chat_id: &str, message_id: &str) -> String {
+    format!(
+        "{}/v1/users/ME/conversations/{}/messages/{}?behavior=softDelete",
+        base,
+        encode_uri_component(chat_id),
+        message_id
+    )
+}
+
 /// Edit body for the native chat API. `skypeeditedid` carries the original
 /// id so receivers (and our realtime parser) classify it as an edit.
 pub fn edit_message_body(message_id: &str, text: &str) -> serde_json::Value {
@@ -248,7 +273,7 @@ pub async fn delete_message_with_client(
     message_id: &str,
 ) -> Result<()> {
     let base = client.chat_service_url();
-    let url = message_url(&base, chat_id, message_id);
+    let url = message_delete_url(&base, chat_id, message_id);
     tracing::debug!("Deleting message at {}", url);
     client.chat_delete(&url, None).await?;
     Ok(())
@@ -547,6 +572,19 @@ src="x">"#));
             "https://h/m?view=x&pageSize=50"
         );
         assert_eq!(with_page_size("https://h/m", 50), "https://h/m");
+    }
+
+    #[test]
+    fn delete_url_is_web_client_soft_delete() {
+        assert_eq!(
+            message_delete_url("https://h", "19:abc@thread.v2", "123"),
+            "https://h/v1/users/ME/conversations/19%3Aabc%40thread.v2/messages/123?behavior=softDelete"
+        );
+        // Edit keeps the raw id shape (unchanged).
+        assert_eq!(
+            message_url("https://h", "19:chat", "123"),
+            "https://h/v1/users/ME/conversations/19:chat/messages/123"
+        );
     }
 
     #[test]
