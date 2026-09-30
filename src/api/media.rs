@@ -116,6 +116,25 @@ pub async fn fetch_media_data(client: &TeamsClient, url: &str) -> Result<MediaBy
     client.media_get(u).await
 }
 
+/// Reads the first `max_bytes` of a media URL within `timeout` (an
+/// image-header probe). Same host rules as [`fetch_media_data`]; the
+/// returned bytes are a prefix, never the whole file.
+pub async fn fetch_media_head_data(
+    client: &TeamsClient,
+    url: &str,
+    max_bytes: usize,
+    timeout: std::time::Duration,
+) -> Result<MediaBytes> {
+    let u = url.trim();
+    if !u.starts_with("https://") {
+        bail!("media: only https URLs are fetched");
+    }
+    if host_of(u).is_none() {
+        bail!("media: unparseable URL");
+    }
+    client.media_get_head(u, max_bytes.clamp(1, MAX_BYTES), timeout).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

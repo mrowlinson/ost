@@ -221,6 +221,75 @@ impl TeamsClient {
         Self::media_fetch(&self.http, url, &headers).await
     }
 
+    /// Reads only the first `max_bytes` of a media URL with an HTTP
+    /// `Range: bytes=0-N` request: enough for an image header without
+    /// downloading the file. Same auth rules as [`Self::media_get`]. A
+    /// server that ignores `Range` and answers 200 with the whole body is
+    /// read only up to `max_bytes`. The whole request (connect, headers
+    /// and body) must finish within `timeout`. The result is a PREFIX:
+    /// callers must not cache it as the complete file.
+    pub async fn media_get_head(
+        &self,
+        url: &str,
+        max_bytes: usize,
+        timeout: std::time::Duration,
+    ) -> Result<super::media::MediaBytes> {
+        let headers = if super::media::needs_auth(url) {
+            let token = self.skype_token()?;
+            super::media::auth_headers(url, &token)
+        } else {
+            Vec::new()
+        };
+        Self::media_head_fetch(&self.http, url, &headers, max_bytes, timeout).await
+    }
+
+    /// Transport core behind [`Self::media_get_head`]: ranged GET with
+    /// exactly the given headers, status-checked, body read only up to
+    /// `max_bytes`, bounded by a whole-request deadline.
+    async fn media_head_fetch(
+        http: &reqwest::Client,
+        url: &str,
+        headers: &[(&'static str, String)],
+        max_bytes: usize,
+        timeout: std::time::Duration,
+    ) -> Result<super::media::MediaBytes> {
+        let range = format!("bytes=0-{}", max_bytes.saturating_sub(1));
+        let mut req = http.get(url).header("Range", range);
+        for (name, value) in headers {
+            req = req.header(*name, value.as_str());
+        }
+        tracing::debug!("Media head GET {}", url);
+        let read = async {
+            let resp = req
+                .send()
+                .await
+                .with_context(|| format!("Media head GET {} failed", url))?;
+            let mut resp = check_response(resp, url).await?;
+            let content_type = resp
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(String::from);
+            let mut data: Vec<u8> = Vec::new();
+            while data.len() < max_bytes {
+                match resp
+                    .chunk()
+                    .await
+                    .with_context(|| format!("Media head GET {} body failed", url))?
+                {
+                    Some(c) => data.extend_from_slice(&c),
+                    None => break,
+                }
+            }
+            data.truncate(max_bytes);
+            Ok(super::media::MediaBytes { data, content_type })
+        };
+        match tokio::time::timeout(timeout, read).await {
+            Ok(r) => r,
+            Err(_) => bail!("Media head GET {} timed out after {:?}", url, timeout),
+        }
+    }
+
     /// Transport core behind [`Self::media_get`]: GET with exactly the
     /// given headers, status-checked, body capped. Split out so the
     /// om-imgfix repro matrix can drive it against a local stub.
@@ -500,6 +569,53 @@ mod tests {
             format!("{err:#}").contains("exceeds"),
             "says exceeds: {err:#}"
         );
+        task.await.expect("stub drains");
+    }
+
+    /// The head probe asks for a byte range and never returns more than
+    /// asked, even when the server ignores `Range` and sends everything.
+    #[tokio::test]
+    async fn media_head_sends_range_and_caps_body() {
+        let (base, hits, task) = start_stub(vec![plain(
+            "200 OK",
+            "image/png",
+            b"0123456789abcdefghij",
+        )])
+        .await;
+        let http = reqwest::Client::new();
+        let mb = TeamsClient::media_head_fetch(
+            &http,
+            &(base + "/img"),
+            &[],
+            10,
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect("head ok");
+        assert_eq!(mb.data, b"0123456789");
+        assert_eq!(mb.content_type.as_deref(), Some("image/png"));
+        task.await.expect("stub drains");
+        let hits = hits.lock().expect("hit log");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].headers.get("range").map(String::as_str), Some("bytes=0-9"));
+    }
+
+    /// HTTP errors surface instead of returning an error body as bytes.
+    #[tokio::test]
+    async fn media_head_surfaces_http_errors() {
+        let (base, _, task) =
+            start_stub(vec![plain("404 Not Found", "application/json", b"{}")]).await;
+        let http = reqwest::Client::new();
+        let err = TeamsClient::media_head_fetch(
+            &http,
+            &(base + "/img"),
+            &[],
+            10,
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect_err("404 is an error");
+        assert!(format!("{err:#}").contains("404"), "{err:#}");
         task.await.expect("stub drains");
     }
 }
