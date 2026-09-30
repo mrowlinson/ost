@@ -44,6 +44,7 @@ pub use filesearch::{
 pub use me::whoami_data;
 pub use presence::get_presence_data;
 pub use teams::{
+    channel_path, delete_channel_data, update_channel_body, update_channel_data,
     add_member_body, add_team_member_data, create_channel_body, create_channel_data,
     create_channel_path, join_team_data, list_team_members_data, list_teams_data, member_path,
     members_path, remove_team_member_data,
