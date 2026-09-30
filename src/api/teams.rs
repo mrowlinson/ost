@@ -935,6 +935,159 @@ mod mt_create_tests {
     }
 }
 
+/// Percent-encode one URL path segment like the web client's
+/// `encodeURIComponent` (unreserved `A-Za-z0-9-_.~` kept).
+fn encode_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
+/// True for a Teams thread id (`19:...@thread...`), the middle tier's
+/// team and channel id form.
+pub fn is_thread_id(id: &str) -> bool {
+    let t = id.trim();
+    t.starts_with("19:") && t.contains("@thread")
+}
+
+/// The team thread id from a Graph `team` answer (`internalId`). Pure.
+pub fn team_internal_id(v: &serde_json::Value) -> Option<String> {
+    v.get("internalId")
+        .and_then(|s| s.as_str())
+        .map(str::trim)
+        .filter(|s| is_thread_id(s))
+        .map(String::from)
+}
+
+/// Resolve the middle tier's team id (team thread id) from the Graph
+/// group id the app lists teams by. Thread ids pass through; group ids
+/// read Graph `GET /teams/{id}?$select=internalId`.
+pub async fn team_thread_id(client: &TeamsClient, team_id: &str) -> Result<String> {
+    if is_thread_id(team_id) {
+        return Ok(team_id.trim().to_string());
+    }
+    check_id("team_id", team_id)?;
+    let v: serde_json::Value = client
+        .graph_get(&format!("/teams/{}?$select=internalId", team_id.trim()))
+        .await?
+        .json()
+        .await
+        .context("Failed to parse team response")?;
+    team_internal_id(&v).context("the team's Teams id (internalId) is missing")
+}
+
+/// Middle-tier URL for one channel of one team (ids percent-encoded). Pure.
+pub fn mt_channel_url(mt: &str, team_thread: &str, channel_id: &str) -> String {
+    format!(
+        "{}/beta/teams/{}/channels/{}",
+        mt.trim_end_matches('/'),
+        encode_component(team_thread.trim()),
+        encode_component(channel_id.trim())
+    )
+}
+
+/// DELETE body: the web client sends the channel's descriptor; this is
+/// the subset known here (channel id, host team thread + group id).
+/// Inferred minimal: the middle tier keys the delete on the URL.
+pub fn mt_delete_channel_body(channel_id: &str, team_thread: &str, group_id: &str) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "id": channel_id.trim(),
+        "hostTeamId": team_thread.trim(),
+        "isGeneral": false,
+    });
+    if !group_id.trim().is_empty() && !is_thread_id(group_id) {
+        body["hostTeamGroupId"] = serde_json::Value::String(group_id.trim().to_string());
+    }
+    body
+}
+
+/// Rename a channel and/or change its description through the Teams
+/// middle tier (`PATCH {mt}/beta/teams/{team}/channels/{channel}`, body
+/// `displayName`/`description`, as [`update_channel_body`] builds it).
+/// Alternative to [`update_channel_data`] for tokens without Graph
+/// `ChannelSettings.ReadWrite.All`. An empty change is rejected before
+/// any network; the service's refusal (e.g. renaming General) surfaces.
+pub async fn update_channel_via_middle_tier(
+    client: &TeamsClient,
+    team_id: &str,
+    channel_id: &str,
+    name: Option<&str>,
+    description: Option<&str>,
+) -> Result<()> {
+    check_id("team_id", team_id)?;
+    check_id("channel_id", channel_id)?;
+    let body = update_channel_body(name, description);
+    if body.as_object().map(|o| o.is_empty()).unwrap_or(true) {
+        bail!("nothing to update");
+    }
+    let team = team_thread_id(client, team_id).await?;
+    let url = mt_channel_url(&client.middle_tier_url(), &team, channel_id);
+    client.mt_send_json("PATCH", &url, &body, None).await?;
+    Ok(())
+}
+
+/// Delete one standard channel through the Teams middle tier (`DELETE
+/// {mt}/beta/teams/{team}/channels/{channel}`); Teams keeps deleted
+/// channels restorable for 30 days. Alternative to
+/// [`delete_channel_data`] for tokens without Graph `Channel.Delete.All`.
+/// The General channel (its id is the team's thread id) is refused before
+/// any network, as are empty or path-breaking ids. Private/shared
+/// channels use a separate provisioning service in the web client, not
+/// wired here; the middle tier's answer surfaces as-is.
+pub async fn delete_channel_via_middle_tier(
+    client: &TeamsClient,
+    team_id: &str,
+    channel_id: &str,
+) -> Result<()> {
+    check_id("team_id", team_id)?;
+    check_id("channel_id", channel_id)?;
+    let team = team_thread_id(client, team_id).await?;
+    if channel_id.trim() == team {
+        bail!("The General channel can't be deleted");
+    }
+    let url = mt_channel_url(&client.middle_tier_url(), &team, channel_id);
+    let body = mt_delete_channel_body(channel_id, &team, team_id);
+    client.mt_send_json("DELETE", &url, &body, None).await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod mt_channel_tests {
+    use super::*;
+
+    #[test]
+    fn channel_edit_delete_middle_tier_shapes() {
+        assert!(is_thread_id("19:abc@thread.tacv2"));
+        assert!(!is_thread_id("550e8400-e29b-41d4-a716-446655440000"));
+        assert_eq!(
+            team_internal_id(&serde_json::json!({"internalId": " 19:t@thread.tacv2 "})),
+            Some("19:t@thread.tacv2".to_string())
+        );
+        assert_eq!(team_internal_id(&serde_json::json!({"internalId": "x"})), None);
+        assert_eq!(team_internal_id(&serde_json::json!({})), None);
+        assert_eq!(
+            mt_channel_url("https://mt/", "19:t@thread.tacv2", "19:c@thread.tacv2"),
+            "https://mt/beta/teams/19%3At%40thread.tacv2/channels/19%3Ac%40thread.tacv2"
+        );
+        assert_eq!(
+            mt_delete_channel_body("19:c@thread.tacv2", "19:t@thread.tacv2", "group-1"),
+            serde_json::json!({
+                "id": "19:c@thread.tacv2",
+                "hostTeamId": "19:t@thread.tacv2",
+                "hostTeamGroupId": "group-1",
+                "isGeneral": false,
+            })
+        );
+        let no_group = mt_delete_channel_body("19:c@thread.tacv2", "19:t@thread.tacv2", "19:t@thread.tacv2");
+        assert!(no_group.get("hostTeamGroupId").is_none());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
