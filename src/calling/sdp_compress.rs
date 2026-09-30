@@ -16,7 +16,7 @@ use flate2::{Compress, Decompress, FlushCompress, FlushDecompress, Status};
 /// SDP compression dictionary extracted from libSkyLib.so at offset 0x1ff6d4.
 /// This 20623-byte string contains representative SDP/HTTP content that the
 /// deflate algorithm uses as a preset dictionary for better compression.
-const SDP_DICTIONARY: &[u8; 20623] = include_bytes!("sdp_dictionary.bin");
+const SDP_DICTIONARY: &[u8; 20476] = include_bytes!("sdp_dictionary.bin");
 
 /// Minimum SDP size for compression (from binary analysis at 0x009adaf0).
 const COMPRESSION_THRESHOLD: usize = 1201;

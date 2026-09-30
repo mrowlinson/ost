@@ -3,6 +3,8 @@
 pub mod apps;
 mod chat;
 pub mod client;
+mod files;
+mod filesearch;
 mod graph;
 mod me;
 pub mod media;
@@ -14,6 +16,9 @@ use anyhow::Result;
 // Re-export data types for TUI integration
 pub use apps::{app_catalog_data, AppCatalog, AppEntitlement, AppManifest, ConfigurableTab, StaticTab, WebApplicationInfo};
 pub use chat::{ChatInfo, MessageInfo, MessagesPage, ReactionCount, REACTION_EMOJI};
+// Re-exported for future TUI/file-browser callers; unused by the CLI today.
+#[allow(unused_imports)]
+pub use files::{FileVersion, SharedFile};
 pub use me::UserInfo;
 pub use presence::PresenceInfo;
 pub use teams::TeamInfo;
@@ -46,6 +51,20 @@ pub use teams::{
     TeamCreateResult, TeamsAsyncOperation, TEAM_CREATE_POLL_SECS,
     TEAM_CREATE_TIMEOUT_SECS,
 };
+#[allow(unused_imports)]
+pub use files::{
+    copy_body, copy_file_data, create_link_data, delete_file_data, download_file_data,
+    download_file_version_data, drive_item_path, folder_children_path, list_chat_files_data,
+    list_chat_files_data_opts, list_file_versions_data, list_folder_children_data,
+    move_body, move_file_data, rename_body, rename_file_data, restore_file_version_data,
+    upload_file_data,
+};
+pub use filesearch::{
+    clamp_limit, drive_search_path, parse_drive_search_response,
+    parse_people_search_response, people_search_path, search_files_data,
+    search_people_data, FIND_MAX_LIMIT,
+};
+pub use teams::{channel_path, delete_channel_data, update_channel_body, update_channel_data};
 
 /// List recent chats (native Teams API)
 pub async fn list_chats(limit: usize) -> Result<()> {
@@ -95,6 +114,36 @@ pub async fn whoami() -> Result<()> {
 /// List joined teams and their channels
 pub async fn list_teams() -> Result<()> {
     teams::list_teams().await
+}
+
+/// List shared files in a chat or channel
+pub async fn list_files(chat_id: &str, limit: usize) -> Result<()> {
+    files::list_files(chat_id, limit).await
+}
+
+/// Download a shared file by drive+item id
+pub async fn download_file(drive_id: &str, item_id: &str, dest: &str) -> Result<()> {
+    files::download_file(drive_id, item_id, dest).await
+}
+
+/// Upload a local file to a chat or channel
+pub async fn upload_file(chat_id: &str, local_path: &str) -> Result<()> {
+    files::upload_file(chat_id, local_path).await
+}
+
+/// Create a view-only sharing link for a shared file
+pub async fn create_link(drive_id: &str, item_id: &str, scope: &str) -> Result<()> {
+    files::create_link(drive_id, item_id, scope).await
+}
+
+/// Search OneDrive files by name/content (om-jb-filesearch)
+pub async fn search_files(query: &str, limit: usize) -> Result<()> {
+    filesearch::search_files(query, limit).await
+}
+
+/// Search the directory for people (om-jb-filesearch)
+pub async fn search_people(query: &str, limit: usize) -> Result<()> {
+    filesearch::search_people(query, limit).await
 }
 
 /// List one team's roster (members + owners; `owners_only` filters)

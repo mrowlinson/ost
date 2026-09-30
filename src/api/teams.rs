@@ -215,6 +215,69 @@ pub async fn create_channel_data(
 }
 
 // ---------------------------------------------------------------------------
+// Channel edit + delete
+// ---------------------------------------------------------------------------
+
+/// Graph path for one channel in one team (pure so tests pin it).
+pub fn channel_path(team_id: &str, channel_id: &str) -> String {
+    format!("/teams/{}/channels/{}", team_id.trim(), channel_id.trim())
+}
+
+/// PATCH body for a channel edit: only the fields that change. A blank
+/// description clears it (Graph takes `""`); `None` leaves it alone.
+pub fn update_channel_body(name: Option<&str>, description: Option<&str>) -> serde_json::Value {
+    let mut body = serde_json::json!({});
+    if let Some(n) = name.map(str::trim).filter(|n| !n.is_empty()) {
+        body["displayName"] = serde_json::Value::String(n.to_string());
+    }
+    if let Some(d) = description {
+        body["description"] = serde_json::Value::String(d.trim().to_string());
+    }
+    body
+}
+
+/// Rename a channel and/or change its description.
+///
+/// Graph `PATCH /teams/{team-id}/channels/{channel-id}` (204). The
+/// General channel cannot be renamed; Graph answers 400 and the detail
+/// surfaces to the caller. An empty change is rejected before any
+/// network.
+pub async fn update_channel_data(
+    client: &TeamsClient,
+    team_id: &str,
+    channel_id: &str,
+    name: Option<&str>,
+    description: Option<&str>,
+) -> Result<()> {
+    check_id("team_id", team_id)?;
+    check_id("channel_id", channel_id)?;
+    let body = update_channel_body(name, description);
+    if body.as_object().map(|o| o.is_empty()).unwrap_or(true) {
+        bail!("nothing to update");
+    }
+    client
+        .graph_patch(&channel_path(team_id, channel_id), &body)
+        .await?;
+    Ok(())
+}
+
+/// Delete one channel (Graph `DELETE /teams/{team-id}/channels/{id}`,
+/// 204). Teams keeps deleted channels restorable for 30 days. Empty or
+/// path-breaking ids are rejected before any network.
+pub async fn delete_channel_data(
+    client: &TeamsClient,
+    team_id: &str,
+    channel_id: &str,
+) -> Result<()> {
+    check_id("team_id", team_id)?;
+    check_id("channel_id", channel_id)?;
+    client
+        .graph_delete(&channel_path(team_id, channel_id))
+        .await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Team members + owners (om-h5-members)
 // ---------------------------------------------------------------------------
 
@@ -965,6 +1028,29 @@ mod tests {
         assert!(infos[1].email.is_none());
         assert_eq!(infos[2].display_name, "M3"); // missing -> membership id
         assert!(!infos[2].is_owner); // missing roles -> member
+    }
+
+    #[test]
+    fn channel_edit_delete_path_and_body() {
+        assert_eq!(
+            channel_path(" team-1 ", "19:abc@thread.tacv2"),
+            "/teams/team-1/channels/19:abc@thread.tacv2"
+        );
+        assert_eq!(
+            update_channel_body(Some("  Launch  "), None),
+            serde_json::json!({"displayName": "Launch"})
+        );
+        assert_eq!(
+            update_channel_body(None, Some(" Plans ")),
+            serde_json::json!({"description": "Plans"})
+        );
+        assert_eq!(
+            update_channel_body(Some("  "), Some("")),
+            serde_json::json!({"description": ""})
+        );
+        assert_eq!(update_channel_body(Some(" "), None), serde_json::json!({}));
+        assert!(check_id("channel_id", "19:abc@thread.tacv2").is_ok());
+        assert!(check_id("channel_id", "19:a/b@thread.tacv2").is_err());
     }
 
     #[test]
