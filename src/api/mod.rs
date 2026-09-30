@@ -23,7 +23,9 @@ pub use teams::ChannelInfo;
 
 // Re-export data-returning functions for TUI integration
 pub use chat::{
-    list_chats_data, read_messages_data, read_messages_page, send_message_with_client,
+    find_by_client_id, find_message_by_client_id, list_chats_data, new_client_message_id,
+    read_messages_data, read_messages_page, send_message_with_client, send_message_with_client_id,
+    sent_id_from_response, SentMessage,
 };
 pub use media::{fetch_media_data, MediaBytes, MAX_BYTES};
 pub use me::whoami_data;
