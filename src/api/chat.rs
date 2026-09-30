@@ -588,6 +588,56 @@ pub async fn set_chat_hidden_with_client(
     Ok(())
 }
 
+/// PUT target for one conversation property of the signed-in user.
+pub fn conversation_property_url(base: &str, chat_id: &str, name: &str) -> String {
+    format!(
+        "{}/v1/users/ME/conversations/{}/properties?name={}",
+        base,
+        chat_id.trim(),
+        name
+    )
+}
+
+/// Chat-service property writes, in order: hide (`Some(now_ms)`) or
+/// unhide (`None`). Each body is `{<name>: <value>}`, the shape the Teams
+/// web client sends. Pure.
+pub fn hide_chat_properties(hidden_at_ms: Option<u64>) -> Vec<(&'static str, serde_json::Value)> {
+    match hidden_at_ms {
+        Some(t) => vec![
+            ("unpinnedTime", serde_json::json!({ "unpinnedTime": t })),
+            ("historyHiddenTime", serde_json::json!({ "historyHiddenTime": t.to_string() })),
+        ],
+        None => vec![("unpinnedTime", serde_json::json!({ "unpinnedTime": null }))],
+    }
+}
+
+/// Hide or unhide one chat for the signed-in user through the chat
+/// service conversation properties. Unlike [`set_chat_hidden_with_client`]
+/// it needs no Graph `Chat.ReadWrite` grant and no user/tenant ids.
+pub async fn set_chat_hidden_via_chat_service(client: &TeamsClient, chat_id: &str, hidden: bool) -> Result<()> {
+    let id = chat_id.trim();
+    if id.is_empty() {
+        bail!("empty chat_id");
+    }
+    let now = if hidden {
+        Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+        )
+    } else {
+        None
+    };
+    let base = client.chat_service_url();
+    for (name, body) in hide_chat_properties(now) {
+        client
+            .chat_put(&conversation_property_url(&base, id, name), &body)
+            .await?;
+    }
+    Ok(())
+}
+
 /// Chat service aggregator resource for folder reads.
 pub const CHATSVCAGG_SCOPE: &str = "https://chatsvcagg.teams.microsoft.com/.default";
 
@@ -703,6 +753,20 @@ mod chatmenu_tests {
         assert_eq!(b["user"]["id"], "oid-1");
         assert_eq!(b["user"]["tenantId"], "tid-2");
         assert_eq!(b["user"]["@odata.type"], "#microsoft.graph.teamworkUserIdentity");
+    }
+
+    #[test]
+    fn hide_via_chat_service_request_shape() {
+        assert_eq!(
+            conversation_property_url("https://h", " 19:a@thread.v2 ", "unpinnedTime"),
+            "https://h/v1/users/ME/conversations/19:a@thread.v2/properties?name=unpinnedTime"
+        );
+        let hide = hide_chat_properties(Some(1727600000123));
+        assert_eq!(hide.len(), 2);
+        assert_eq!(hide[0], ("unpinnedTime", serde_json::json!({"unpinnedTime": 1727600000123u64})));
+        assert_eq!(hide[1], ("historyHiddenTime", serde_json::json!({"historyHiddenTime": "1727600000123"})));
+        let show = hide_chat_properties(None);
+        assert_eq!(show, vec![("unpinnedTime", serde_json::json!({"unpinnedTime": null}))]);
     }
 
     #[test]
