@@ -25,7 +25,7 @@ pub use teams::ChannelInfo;
 pub use chat::{
     create_one_to_one_chat_data, delete_message_with_client, edit_message_body,
     edit_message_with_client, emoji_for_reaction_type, leave_chat_with_client, leave_member_url,
-    list_chats_data, message_url, one_to_one_create_body, one_to_one_create_path,
+    list_chats_data, message_url, one_to_one_thread_body, one_to_one_thread_id,
     own_member_mri, parse_created_chat, reaction_add_body, reaction_add_url, reaction_remove_url,
     reaction_type_for_emoji, read_messages_data, read_messages_page, remove_reaction_with_client,
     send_message_with_client, send_reaction_with_client,

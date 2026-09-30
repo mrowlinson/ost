@@ -325,27 +325,72 @@ pub async fn leave_chat(chat_id: &str) -> Result<()> {
 // 1:1 chat create (om-lt5-person11: person-pick opens 1:1)
 // ---------------------------------------------------------------------------
 
-/// `POST /me/chats` path for 1:1 creation. Pure so tests pin it.
-pub fn one_to_one_create_path() -> &'static str {
-    "/me/chats"
+/// Chat-service 1:1 thread id for two AAD object ids (pure):
+/// `19:<lo>_<hi>@unq.gbl.spaces`, ids lowercased and in ascending order.
+/// The same pair always names the same thread, so an existing 1:1
+/// re-opens instead of a duplicate being minted.
+pub fn one_to_one_thread_id(a: &str, b: &str) -> String {
+    let (a, b) = (a.trim().to_ascii_lowercase(), b.trim().to_ascii_lowercase());
+    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+    format!("19:{}_{}@unq.gbl.spaces", lo, hi)
 }
 
-/// `POST /me/chats` body for a 1:1 with `user` (AAD id or UPN).
-/// Self is implied (members carries the peer only, owner role).
-/// Pure so tests pin it.
-pub fn one_to_one_create_body(user: &str) -> serde_json::Value {
+fn looks_like_guid(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('-').collect();
+    parts.len() == 5
+        && [8, 4, 4, 4, 12].iter().zip(&parts).all(|(n, p)| p.len() == *n)
+        && s.chars().all(|c| c == '-' || c.is_ascii_hexdigit())
+}
+
+/// AAD object id for `me` or a user ref (an AAD id passes through; a UPN
+/// or mail address resolves via Graph `GET /users/{ref}?$select=id`).
+async fn aad_object_id(client: &TeamsClient, user: &str) -> Result<String> {
+    let u = user.trim();
+    if looks_like_guid(u) {
+        return Ok(u.to_ascii_lowercase());
+    }
+    let path = if u == "me" {
+        "/me?$select=id".to_string()
+    } else {
+        let seg: String = u
+            .bytes()
+            .map(|b| match b {
+                b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'@' | b'.' | b'-' | b'_' => {
+                    (b as char).to_string()
+                }
+                _ => format!("%{:02X}", b),
+            })
+            .collect();
+        format!("/users/{}?$select=id", seg)
+    };
+    let v: serde_json::Value = client
+        .graph_get(&path)
+        .await?
+        .json()
+        .await
+        .context("Failed to parse user id response")?;
+    v["id"]
+        .as_str()
+        .filter(|s| looks_like_guid(s))
+        .map(str::to_ascii_lowercase)
+        .context("user id missing")
+}
+
+/// Chat-service body creating the 1:1 thread for two AAD ids (pure).
+/// `uniquerosterthread` + `fixedRoster` make it the pair's one 1:1
+/// (`19:<lo>_<hi>@unq.gbl.spaces`), never a group thread.
+pub fn one_to_one_thread_body(me: &str, peer: &str) -> serde_json::Value {
     serde_json::json!({
-        "chatType": "oneOnOne",
         "members": [
-            {
-                "@odata.type": "#microsoft.graph.aadUserConversationMember",
-                "roles": ["owner"],
-                "user@odata.bind": format!(
-                    "https://graph.microsoft.com/v1.0/users('{}')",
-                    user.trim()
-                ),
-            }
+            {"id": format!("8:orgid:{}", peer.trim().to_ascii_lowercase()), "role": "Admin"},
+            {"id": format!("8:orgid:{}", me.trim().to_ascii_lowercase()), "role": "Admin"},
         ],
+        "properties": {
+            "threadType": "chat",
+            "chatFilesIndexId": "2",
+            "fixedRoster": "true",
+            "uniquerosterthread": "true",
+        },
     })
 }
 
@@ -371,10 +416,13 @@ pub fn parse_created_chat(value: &serde_json::Value) -> Result<ChatInfo> {
     })
 }
 
-/// Create (or re-open) a 1:1 chat with `user` (AAD id or UPN) via
-/// Graph `POST /me/chats` and return the thread. Empty refs are
-/// rejected before any network. Note: Graph mints a new thread
-/// per call — no existing-1:1 lookup (minimal path).
+/// Create (or re-open) the 1:1 chat with `user` (AAD id or UPN) and
+/// return the thread. Empty refs are rejected before any network.
+/// Graph `POST /me/chats` is not a create endpoint (405) and Graph
+/// `POST /chats` needs Chat.Create, which the Teams web token lacks, so
+/// the thread is opened on the chat service instead: both AAD ids map to
+/// the derived thread id ([`one_to_one_thread_id`]); an existing thread
+/// re-opens; a first contact creates the unique-roster 1:1.
 pub async fn create_one_to_one_chat_data(
     client: &TeamsClient,
     user: &str,
@@ -382,17 +430,43 @@ pub async fn create_one_to_one_chat_data(
     if user.trim().is_empty() {
         bail!("empty user");
     }
-    let resp = client
-        .graph_post(
-            one_to_one_create_path(),
-            &one_to_one_create_body(user),
-        )
-        .await?;
-    let value: serde_json::Value = resp
-        .json()
-        .await
-        .context("Failed to parse created chat response")?;
-    parse_created_chat(&value)
+    let me = aad_object_id(client, "me").await?;
+    let peer = aad_object_id(client, user).await?;
+    if me == peer {
+        bail!("cannot open a 1:1 chat with yourself");
+    }
+    let derived = one_to_one_thread_id(&me, &peer);
+    let base = client.chat_service_url();
+    let probe = format!("{}/v1/threads/{}?view=msnp24Equivalent", base, derived);
+    let missing = match client.chat_get(&probe).await {
+        Ok(_) => false,
+        Err(e) => format!("{:#}", e).starts_with("HTTP 404"),
+    };
+    if missing {
+        let resp = client
+            .chat_post(&format!("{}/v1/threads", base), &one_to_one_thread_body(&me, &peer))
+            .await
+            .context("1:1 thread create failed")?;
+        let made = resp
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|l| l.split('?').next())
+            .and_then(|l| l.rsplit('/').next())
+            .map(|id| id.replace("%3A", ":").replace("%3a", ":").replace("%40", "@"))
+            .unwrap_or_default();
+        if !made.is_empty() && made != derived {
+            bail!("1:1 thread create answered an unexpected thread");
+        }
+    }
+    Ok(ChatInfo {
+        id: derived,
+        name: String::new(),
+        is_group: false,
+        last_message_time: None,
+        last_message_sender: None,
+        last_message_preview: None,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -868,20 +942,25 @@ src="x">"#));
     }
 
     #[test]
-    fn one_to_one_create_shape() {
-        assert_eq!(one_to_one_create_path(), "/me/chats");
-        let b = one_to_one_create_body("  aad-1 ");
-        assert_eq!(b["chatType"], "oneOnOne");
-        let m = &b["members"][0];
-        assert_eq!(
-            m["@odata.type"],
-            "#microsoft.graph.aadUserConversationMember"
-        );
-        assert_eq!(m["roles"][0], "owner");
-        assert_eq!(
-            m["user@odata.bind"],
-            "https://graph.microsoft.com/v1.0/users('aad-1')"
-        );
+    fn one_to_one_thread_id_is_ordered_pair() {
+        let a = "527A0000-0000-0000-0000-000000000001";
+        let b = "01d90000-0000-0000-0000-000000000002";
+        let want = "19:01d90000-0000-0000-0000-000000000002_527a0000-0000-0000-0000-000000000001@unq.gbl.spaces";
+        assert_eq!(one_to_one_thread_id(a, b), want);
+        assert_eq!(one_to_one_thread_id(b, a), want);
+        assert!(looks_like_guid(b));
+        assert!(!looks_like_guid("someone@example.org"));
+    }
+
+    #[test]
+    fn one_to_one_thread_body_shape() {
+        let b = one_to_one_thread_body(" ME-1 ", "Peer-2");
+        assert_eq!(b["members"][0]["id"], "8:orgid:peer-2");
+        assert_eq!(b["members"][1]["id"], "8:orgid:me-1");
+        assert_eq!(b["members"][0]["role"], "Admin");
+        assert_eq!(b["properties"]["threadType"], "chat");
+        assert_eq!(b["properties"]["uniquerosterthread"], "true");
+        assert_eq!(b["properties"]["fixedRoster"], "true");
     }
 
     #[test]
