@@ -32,7 +32,7 @@ pub use teams::ChannelInfo;
 pub use chat::{list_chats_data, read_messages_data, send_message_with_client};
 pub use me::whoami_data;
 pub use presence::get_presence_data;
-pub use tabs::list_tabs_data;
+pub use tabs::{list_chat_tabs_data, list_tabs_data};
 pub use teams::list_teams_data;
 
 /// List recent chats (native Teams API)
